@@ -16,3 +16,5 @@ cargo sycamore --version
 
 See [USAGE.md](USAGE.md) for build, watch, and development-server workflows,
 configuration, Tailwind CSS and WASM optimization, examples, and tool downloads.
+
+To see default configuration options, see [Sycamore.toml](Sycamore.toml).
