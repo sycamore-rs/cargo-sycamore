@@ -25,3 +25,9 @@ port = 8080
 autoreload = true
 # Serve index.html for missing routes; override with --spa or --spa=false.
 spa = false
+
+# Setting any Tailwind option enables the compiler in builds/watch/serve.
+# [tools.tailwindcss]
+# input = "index.css" # Default; relative to this config file.
+# output = "dist/index.css" # Omit to follow the build output directory.
+# version = "4.3.5" # Pinned default.

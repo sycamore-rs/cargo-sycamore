@@ -12,6 +12,8 @@ use serde::Deserialize;
 
 /// Pinned Binaryen release used by default for reproducible optimization.
 pub const DEFAULT_WASM_OPT_VERSION: &str = "133";
+/// Pinned standalone Tailwind CSS CLI release.
+pub const DEFAULT_TAILWINDCSS_VERSION: &str = "4.3.5";
 
 /// CLI input only. Optional values retain whether the user supplied a flag.
 #[derive(Debug, Default, Args)]
@@ -64,6 +66,30 @@ pub struct ServeArgs {
 pub struct Config {
     pub build: BuildConfig,
     pub serve: ServeConfig,
+    pub tools: ToolsConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolsConfig {
+    pub tailwindcss: TailwindConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TailwindConfig {
+    pub input: Option<PathBuf>,
+    pub output: Option<PathBuf>,
+    pub version: Option<String>,
+}
+
+/// Resolved config-only Tailwind settings. None on Options means disabled.
+#[derive(Debug)]
+pub struct TailwindOptions {
+    pub input: PathBuf,
+    /// None defaults to index.css in the selected build output directory.
+    pub output: Option<PathBuf>,
+    pub version: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -108,6 +134,7 @@ pub struct Options {
     pub default_features: bool,
     pub wasm_opt: bool,
     pub wasm_opt_version: String,
+    pub tailwindcss: Option<TailwindOptions>,
     pub port: u16,
     pub autoreload: bool,
     pub spa: bool,
@@ -127,6 +154,7 @@ impl Default for Options {
             default_features: true,
             wasm_opt: true,
             wasm_opt_version: DEFAULT_WASM_OPT_VERSION.into(),
+            tailwindcss: None,
             port: 8080,
             autoreload: true,
             spa: false,
@@ -185,6 +213,25 @@ impl Options {
             None => (None, Config::default()),
         };
         let base = config_path.as_deref().and_then(Path::parent).unwrap_or(cwd);
+        let tailwind = config.tools.tailwindcss;
+        // Presence must be checked before defaults: an empty table is not opt-in.
+        let tailwindcss = if tailwind.input.is_some()
+            || tailwind.output.is_some()
+            || tailwind.version.is_some()
+        {
+            Some(TailwindOptions {
+                input: absolute(
+                    base,
+                    tailwind.input.as_deref().unwrap_or(Path::new("index.css")),
+                ),
+                output: tailwind.output.as_ref().map(|path| absolute(base, path)),
+                version: tailwind
+                    .version
+                    .unwrap_or_else(|| DEFAULT_TAILWINDCSS_VERSION.into()),
+            })
+        } else {
+            None
+        };
         let file = config.build;
         ensure!(
             args.bin.is_none() || args.example.is_none(),
@@ -222,6 +269,7 @@ impl Options {
                 .unwrap_or_else(|| DEFAULT_WASM_OPT_VERSION.into()),
             features: file.features,
             default_features: file.default_features.unwrap_or(true),
+            tailwindcss,
             config_path,
             port: config.serve.port.unwrap_or(8080),
             autoreload: config.serve.autoreload.unwrap_or(true),
@@ -454,6 +502,92 @@ mod tests {
         args.spa = Some(false);
         assert!(!Options::resolve_serve(&args).unwrap().spa);
         assert!(toml::from_str::<Config>("[serve]\nspa = 'true'").is_err());
+    }
+
+    #[test]
+    fn tailwind_is_opt_in_and_resolves_defaults_and_config_relative_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("config");
+        fs::create_dir(&base).unwrap();
+        let path = base.join("Sycamore.toml");
+        let args = BuildArgs {
+            config: Some(path.clone()),
+            ..Default::default()
+        };
+        for source in ["", "[tools]", "[tools.tailwindcss]"] {
+            fs::write(&path, source).unwrap();
+            assert!(
+                Options::resolve_in(&args, temp.path())
+                    .unwrap()
+                    .tailwindcss
+                    .is_none()
+            );
+        }
+        for setting in [
+            "input = 'styles.css'",
+            "output = 'public/app.css'",
+            "version = '4.0.0'",
+        ] {
+            fs::write(&path, format!("[tools.tailwindcss]\n{setting}\n")).unwrap();
+            let tailwind = Options::resolve_in(&args, temp.path())
+                .unwrap()
+                .tailwindcss
+                .unwrap();
+            assert_eq!(
+                tailwind.input,
+                base.join(if setting.starts_with("input") {
+                    "styles.css"
+                } else {
+                    "index.css"
+                })
+            );
+            assert_eq!(
+                tailwind.output,
+                setting
+                    .starts_with("output")
+                    .then(|| base.join("public/app.css"))
+            );
+            assert_eq!(
+                tailwind.version,
+                if setting.starts_with("version") {
+                    "4.0.0"
+                } else {
+                    DEFAULT_TAILWINDCSS_VERSION
+                }
+            );
+        }
+        for invalid in [
+            "[tools.tailwindcss]\ninput = 123",
+            "[tools.tailwindcss]\nversion = 4",
+            "[tools.tailwindcss]\nminfy = true",
+            "[tools.unknown]\ninput = 'file'",
+        ] {
+            assert!(toml::from_str::<Config>(invalid).is_err());
+        }
+        let absolute = temp.path().join("absolute.css");
+        let config = format!(
+            "[tools.tailwindcss]\ninput = {}\noutput = {}\n",
+            toml::Value::String(absolute.to_string_lossy().into_owned()),
+            toml::Value::String(absolute.to_string_lossy().into_owned())
+        );
+        fs::write(&path, config).unwrap();
+        let tailwind = Options::resolve_in(&args, temp.path())
+            .unwrap()
+            .tailwindcss
+            .unwrap();
+        assert_eq!(tailwind.input, absolute);
+        assert_eq!(tailwind.output, Some(absolute));
+    }
+
+    #[test]
+    fn tailwind_configuration_is_also_supported_in_cargo_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("Cargo.toml"), "[package]\nname = 'app'\nversion = '0.1.0'\n[package.metadata.sycamore.tools.tailwindcss]\ninput = 'styles.css'\noutput = 'dist/site.css'\nversion = '4.0.0'\n").unwrap();
+        let options = Options::resolve_in(&BuildArgs::default(), temp.path()).unwrap();
+        let tailwind = options.tailwindcss.unwrap();
+        assert_eq!(tailwind.input, temp.path().join("styles.css"));
+        assert_eq!(tailwind.output, Some(temp.path().join("dist/site.css")));
+        assert_eq!(tailwind.version, "4.0.0");
     }
 
     #[test]

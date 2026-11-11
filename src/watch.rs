@@ -139,6 +139,7 @@ fn report_build(
 struct WatchPlan {
     workspace: PathBuf,
     config: Option<PathBuf>,
+    tailwind_input: Option<PathBuf>,
     ignored: Vec<PathBuf>,
     roots: Vec<(PathBuf, RecursiveMode)>,
 }
@@ -168,6 +169,13 @@ impl WatchPlan {
         if let Some(output) = &options.out_dir {
             ignored.insert(normalize(&std::path::absolute(output)?));
         }
+        if let Some(output) = options
+            .tailwindcss
+            .as_ref()
+            .and_then(|config| config.output.as_ref())
+        {
+            ignored.insert(normalize(&std::path::absolute(output)?));
+        }
         for output in &ignored {
             ensure!(
                 !workspace.starts_with(output),
@@ -184,9 +192,39 @@ impl WatchPlan {
             // editors which replace the inode on each save.
             roots.push((parent.to_owned(), RecursiveMode::NonRecursive));
         }
+        let tailwind_input = options
+            .tailwindcss
+            .as_ref()
+            .map(|config| normalize(&config.input));
+        if let Some(parent) = tailwind_input.as_deref().and_then(Path::parent)
+            && !roots.iter().any(|(root, mode)| {
+                parent == root
+                    || (matches!(mode, RecursiveMode::Recursive) && parent.starts_with(root))
+            })
+        {
+            // Watch the parent to survive atomic saves. If it doesn't exist yet,
+            // watch its nearest existing ancestor so a missing input can be fixed.
+            if let Some(existing) = parent.ancestors().find(|path| path.is_dir()) {
+                let mode = if existing == parent {
+                    RecursiveMode::NonRecursive
+                } else {
+                    RecursiveMode::Recursive
+                };
+                if let Some((_, existing_mode)) =
+                    roots.iter_mut().find(|(root, _)| root == existing)
+                {
+                    if matches!(mode, RecursiveMode::Recursive) {
+                        *existing_mode = mode;
+                    }
+                } else {
+                    roots.push((existing.to_owned(), mode));
+                }
+            }
+        }
         Ok(Self {
             workspace,
             config,
+            tailwind_input,
             ignored: ignored.into_iter().collect(),
             roots,
         })
@@ -214,8 +252,12 @@ impl WatchPlan {
 
     fn relevant_path(&self, path: &Path) -> bool {
         self.config.as_deref() == Some(path)
-            || (path.starts_with(&self.workspace)
+            || ((path.starts_with(&self.workspace) || self.tailwind_input.as_deref() == Some(path))
                 && !is_editor_artifact(path)
+                && !path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with(".cargo-sycamore-tailwind-") && name.ends_with(".css")
+                })
                 && !path.components().any(|part| part.as_os_str() == ".git")
                 && !self.ignored.iter().any(|ignored| path.starts_with(ignored)))
     }
@@ -317,6 +359,7 @@ mod tests {
         WatchPlan {
             workspace: root.clone(),
             config: Some(root.join("Sycamore.toml")),
+            tailwind_input: None,
             ignored: vec![
                 root.join("target"),
                 root.join("dist"),
@@ -324,6 +367,67 @@ mod tests {
             ],
             roots: vec![(root, RecursiveMode::Recursive)],
         }
+    }
+
+    #[test]
+    fn tailwind_inputs_trigger_rebuilds_but_generated_css_does_not() {
+        let mut plan = plan();
+        let input = plan
+            .workspace
+            .parent()
+            .unwrap()
+            .join("external-styles/input.css");
+        let output = plan.workspace.join("assets/styles.css");
+        plan.tailwind_input = Some(input.clone());
+        plan.ignored.push(output.clone());
+        assert!(plan.relevant_path(&input));
+        assert!(!plan.relevant_path(&input.with_file_name("other.css")));
+        assert!(plan.relevant_path(&plan.workspace.join("src/style.css")));
+        assert!(!plan.relevant_path(&output));
+        assert!(
+            !plan.relevant_path(
+                &plan
+                    .workspace
+                    .join("assets/.cargo-sycamore-tailwind-abc.css")
+            )
+        );
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )))
+        .add_path(
+            plan.workspace
+                .join("assets/.cargo-sycamore-tailwind-abc.css"),
+        )
+        .add_path(output);
+        assert!(!plan.relevant(&event));
+    }
+
+    #[test]
+    fn tailwind_plan_watches_external_input_and_ignores_custom_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let external = temp.path().join("styles");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = 'app'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("src/lib.rs"), "").unwrap();
+        let options = Options {
+            manifest_path: Some(project.join("Cargo.toml")),
+            tailwindcss: Some(crate::options::TailwindOptions {
+                input: external.join("input.css"),
+                output: Some(project.join("assets/site.css")),
+                version: "test-version".into(),
+            }),
+            ..Default::default()
+        };
+        let plan = WatchPlan::new(&options).unwrap();
+        assert!(plan.roots.iter().any(|(path, _)| *path == external));
+        assert!(plan.relevant_path(&external.join("input.css")));
+        assert!(!plan.relevant_path(&project.join("assets/site.css")));
     }
 
     fn event(kind: EventKind, path: PathBuf) -> Event {

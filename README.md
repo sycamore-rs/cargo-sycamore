@@ -57,10 +57,10 @@ and path/git overrides produce an error rather than guessing an incompatible
 CLI version. Multiple versions anywhere in the workspace lockfile must currently
 be unified, even if only one is used by the selected app.
 
-Debug builds download only `wasm-bindgen-cli`; release builds also download
-`wasm-opt` unless disabled. The command generates an HTML entrypoint and WASM web
-bindings, but does not bundle/copy CSS or other
-static assets. Use `serve` for the development server. Existing files in the output directory
+Debug builds download `wasm-bindgen-cli`; release builds also download
+`wasm-opt` unless disabled. When configured, Tailwind CSS is downloaded and run
+in either mode. The command generates an HTML entrypoint and WASM web bindings,
+but does not otherwise bundle/copy CSS or other static assets. Use `serve` for the development server. Existing files in the output directory
 are not cleaned. Set `GITHUB_TOKEN` if needed for GitHub API
 rate limits; it is passed to the downloader for API requests only.
 
@@ -96,6 +96,64 @@ because browser runtimes do not yet support that encoding. The optimizer writes 
 temporary file and replaces the module only after success. Download or optimizer
 failures fail the build; watch/serve report an error and do not trigger a successful
 browser reload. Optimization may increase release rebuild times.
+
+### Tailwind CSS
+
+Enable the standalone Tailwind CSS compiler by setting any option under
+`[tools.tailwindcss]` in `Sycamore.toml`:
+
+```toml
+[tools.tailwindcss]
+input = "styles/input.css"
+# Optional: defaults to index.css inside the resolved build output directory.
+output = "dist/index.css"
+# Optional: pinned default, not a moving latest release.
+version = "4.3.5"
+```
+
+The same settings work in Cargo metadata:
+
+```toml
+[package.metadata.sycamore.tools.tailwindcss]
+input = "styles/input.css"
+```
+
+- Setting **any** of `input`, `output`, or `version` enables Tailwind. An omitted
+  or empty table leaves it disabled; there are no additional CLI flags.
+- The default input is `index.css` beside the selected config file or manifest.
+  Create the input file; for Tailwind v4, start with `@import "tailwindcss";`.
+- Explicit input/output paths are relative to the config file (or metadata's
+  `Cargo.toml`), not the invocation directory. Absolute paths are preserved.
+- An omitted output follows `--out-dir` / `[build].out-dir` and defaults to
+  `<package>/dist/index.css`. An explicit output is used as-is, independently
+  of the build output directory. It must lie inside the resolved build output
+  directory so the generated HTML can reference a servable stylesheet.
+- Version defaults to **4.3.5**. The matching standalone executable is downloaded
+  through the normal tool cache, so npm/Node installation is not required.
+- The compiler runs once for each successful Cargo/wasm-bindgen build, including
+  examples and watch/serve rebuilds, with its working directory set to the selected
+  package root for source scanning. Release builds add `--minify`; debug builds do
+  not. Use Tailwind's `@source` directives if you need additional scan locations.
+- Missing inputs, download errors, and compiler failures fail the build and prevent
+  successful browser reloads. CSS is published atomically, so a failed compiler
+  does not replace the previously generated stylesheet.
+- Watch mode tracks the configured input even outside the workspace and excludes
+  generated CSS and temporary output files to prevent rebuild loops. Other files
+  within the workspace also trigger compilation as usual.
+
+The generated HTML automatically includes the compiled stylesheet in `<head>`:
+
+```html
+<link rel="stylesheet" href="./index.css" data-cargo-sycamore-tailwind>
+```
+
+The URL follows the actual CSS output path, including nested directories, with
+path segments URL-encoded. The reserved `data-cargo-sycamore-tailwind` marker
+allows replacement/removal without changing user-authored links. No link is added
+when Tailwind is disabled. This works with the bundled HTML or a custom template;
+the source template is never modified. Remove any manually added Tailwind link
+from earlier setups to avoid duplicates. Keep input/source files outside generated
+output directories so watch can see edits.
 
 ### HTML entrypoint
 
@@ -337,7 +395,7 @@ port = 8080
 spa = true
 ```
 
-The `build` and `serve` tables are nested under `package.metadata.sycamore`;
+The `build`, `serve`, and `tools` tables are nested under `package.metadata.sycamore`;
 all settings and validation rules are the same as in `Sycamore.toml`. Relative
 paths in metadata are relative to the directory containing that `Cargo.toml`.
 Changes to the selected manifest are picked up by watch/serve just like changes
@@ -379,7 +437,7 @@ are errors. Set `default-features = false` to pass `--no-default-features` to Ca
 `src/options.rs` keeps three separate types:
 
 - `BuildArgs` / `ServeArgs`: clap CLI input, preserving absent flags as `Option` values.
-- `Config` / `BuildConfig` / `ServeConfig`: the supported TOML schema, without CLI-only fields.
+- `Config` / `BuildConfig` / `ServeConfig` / `ToolsConfig` / `TailwindConfig`: the supported TOML schema, without CLI-only fields.
 - `Options`: the final merged values consumed by commands, independent
   of where each value came from.
 

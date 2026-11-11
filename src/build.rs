@@ -14,7 +14,7 @@ use cargo_metadata::{CrateType, Message, Metadata, MetadataCommand, Package, Tar
 use serde::Deserialize;
 
 use crate::{
-    options::Options,
+    options::{Options, TailwindOptions},
     tools::{BuiltinTool, ToolCache},
 };
 
@@ -141,6 +141,19 @@ fn build_with(
     } else {
         None
     };
+    let tailwind = if let Some(config) = &options.tailwindcss {
+        ensure!(
+            config.input.is_file(),
+            "Tailwind CSS input {} is not a file",
+            config.input.display()
+        );
+        Some(
+            ensure_tool(BuiltinTool::TailwindCss, &config.version)
+                .context("ensuring Tailwind CSS is available")?,
+        )
+    } else {
+        None
+    };
     let out_dir = package_output_directory(options, package);
     fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     let output_name = wasm
@@ -166,7 +179,23 @@ fn build_with(
         .manifest_path
         .parent()
         .context("manifest has no parent")?;
-    crate::html::generate(project_root.as_std_path(), &out_dir, output_name)?;
+    let stylesheet = if let (Some(config), Some(tailwind)) = (&options.tailwindcss, tailwind) {
+        Some(compile_tailwind(
+            config,
+            &tailwind,
+            project_root.as_std_path(),
+            &out_dir,
+            options.release,
+        )?)
+    } else {
+        None
+    };
+    crate::html::generate_with_stylesheet(
+        project_root.as_std_path(),
+        &out_dir,
+        output_name,
+        stylesheet.as_deref(),
+    )?;
     eprintln!("Built {} → {}", package.name, out_dir.display());
     Ok(out_dir)
 }
@@ -206,6 +235,68 @@ fn optimize_wasm(wasm: &Path, optimizer: &Path) -> Result<()> {
         .persist(wasm)
         .with_context(|| format!("publishing optimized {}", wasm.display()))?;
     Ok(())
+}
+
+/// Run once per build, publishing CSS only after the compiler succeeds. The
+/// outer workspace watcher owns rebuilding; do not start a second --watch loop.
+fn compile_tailwind(
+    config: &TailwindOptions,
+    executable: &Path,
+    project: &Path,
+    out_dir: &Path,
+    release: bool,
+) -> Result<PathBuf> {
+    let output = config
+        .output
+        .clone()
+        .unwrap_or_else(|| out_dir.join("index.css"));
+    let input = fs::canonicalize(&config.input).context("resolving Tailwind CSS input")?;
+    ensure!(
+        fs::canonicalize(&output).ok().as_ref() != Some(&input),
+        "Tailwind CSS output must not overwrite its input"
+    );
+    let parent = output
+        .parent()
+        .context("Tailwind CSS output has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating CSS output directory {}", parent.display()))?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".cargo-sycamore-tailwind-")
+        .suffix(".css")
+        .tempfile_in(parent)
+        .context("creating temporary Tailwind CSS output")?;
+    let mut command = Command::new(executable);
+    command
+        .current_dir(project)
+        .arg("--input")
+        .arg(&input)
+        .arg("--output")
+        .arg(temporary.path());
+    if release {
+        command.arg("--minify");
+    }
+    eprintln!(
+        "Building Tailwind CSS {} → {}...",
+        config.input.display(),
+        output.display()
+    );
+    let status = command
+        .status()
+        .with_context(|| format!("running Tailwind CSS {}", executable.display()))?;
+    ensure!(
+        status.success(),
+        "Tailwind CSS {} failed ({status})",
+        config.version
+    );
+    // Keep published CSS readable like other generated static assets.
+    let permissions = fs::metadata(&output)
+        .or_else(|_| fs::metadata(&input))?
+        .permissions();
+    fs::set_permissions(temporary.path(), permissions)?;
+    temporary
+        .persist(&output)
+        .with_context(|| format!("publishing Tailwind CSS {}", output.display()))?;
+    Ok(output)
 }
 
 /// Resolve the same output directory as build, without compiling anything.
@@ -759,6 +850,167 @@ mod tests {
                     assert!(!root.join("dist/index.html").exists());
                     assert_eq!(fs::read_dir(root.join("dist")).unwrap().count(), 1);
                 }
+            }
+        }
+
+        #[test]
+        fn builds_tailwind_once_in_debug_and_release_with_expected_paths() {
+            for release in [false, true] {
+                let temp = fixture();
+                let root = temp.path();
+                let cargo = mock_cargo(root, false);
+                fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
+                let input = root.join("input.css");
+                fs::write(&input, "@import 'tailwindcss';").unwrap();
+                let bindgen = root.join("wasm-bindgen");
+                script(&bindgen, "exit 0");
+                let tailwind = root.join("tailwindcss");
+                script(
+                    &tailwind,
+                    &format!(
+                        "printf '%s\\n' \"$@\" > {}\npwd > {}\n[ \"$1\" = --input ]\n[ \"$3\" = --output ]\nprintf 'body {{ color: red }}' > \"$4\"",
+                        quote(root.join("tailwind-args")),
+                        quote(root.join("tailwind-cwd"))
+                    ),
+                );
+                let out = root.join("custom-dist");
+                let explicit_output = release.then(|| out.join("assets/nested/styles.css"));
+                let output = explicit_output
+                    .clone()
+                    .unwrap_or_else(|| out.join("index.css"));
+                let options = Options {
+                    manifest_path: Some(root.join("Cargo.toml")),
+                    out_dir: Some(out.clone()),
+                    release,
+                    wasm_opt: false,
+                    tailwindcss: Some(TailwindOptions {
+                        input: input.clone(),
+                        output: explicit_output,
+                        version: "test-version".into(),
+                    }),
+                    ..Default::default()
+                };
+                let mut tools = Vec::new();
+                let result = build_with(&options, cargo.as_os_str(), |tool, version| {
+                    tools.push(format!("{tool:?}:{version}"));
+                    match tool {
+                        BuiltinTool::WasmBindgenCli => Ok(bindgen.clone()),
+                        BuiltinTool::TailwindCss => Ok(tailwind.clone()),
+                        _ => panic!("unexpected tool"),
+                    }
+                })
+                .unwrap();
+                assert_eq!(result, out);
+                assert_eq!(
+                    tools,
+                    ["WasmBindgenCli:0.2.100", "TailwindCss:test-version"]
+                );
+                assert_eq!(fs::read_to_string(&output).unwrap(), "body { color: red }");
+                let args = fs::read_to_string(root.join("tailwind-args")).unwrap();
+                assert!(args.starts_with(&format!(
+                    "--input\n{}\n--output\n",
+                    fs::canonicalize(input).unwrap().display()
+                )));
+                assert_eq!(args.contains("--minify\n"), release);
+                assert!(!args.contains("--watch"));
+                assert_eq!(
+                    Path::new(
+                        fs::read_to_string(root.join("tailwind-cwd"))
+                            .unwrap()
+                            .trim()
+                    ),
+                    fs::canonicalize(root).unwrap()
+                );
+                let html = fs::read_to_string(out.join("index.html")).unwrap();
+                assert!(html.contains("data-cargo-sycamore-tailwind"));
+                assert!(html.contains(if release {
+                    "href=\"./assets/nested/styles.css\""
+                } else {
+                    "href=\"./index.css\""
+                }));
+                assert_eq!(
+                    fs::read_dir(output.parent().unwrap())
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".cargo-sycamore-tailwind-"))
+                        .count(),
+                    0
+                );
+            }
+        }
+
+        #[test]
+        fn tailwind_failures_preserve_css_and_prevent_html_generation() {
+            for failure in [
+                "download",
+                "exit",
+                "missing-executable",
+                "missing-input",
+                "overwrite-input",
+            ] {
+                let temp = fixture();
+                let root = temp.path();
+                let cargo = mock_cargo(root, false);
+                fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
+                let input = root.join("input.css");
+                if failure != "missing-input" {
+                    fs::write(&input, "source CSS").unwrap();
+                }
+                let output = if failure == "overwrite-input" {
+                    input.clone()
+                } else {
+                    root.join("styles.css")
+                };
+                if failure != "overwrite-input" {
+                    fs::write(&output, "previous CSS").unwrap();
+                }
+                fs::create_dir(root.join("dist")).unwrap();
+                fs::write(root.join("dist/index.html"), "previous HTML").unwrap();
+                let bindgen = root.join("wasm-bindgen");
+                script(&bindgen, "exit 0");
+                let tailwind = root.join("tailwindcss");
+                if failure != "missing-executable" {
+                    script(&tailwind, "printf partial > \"$4\"\nexit 1");
+                }
+                let options = Options {
+                    manifest_path: Some(root.join("Cargo.toml")),
+                    tailwindcss: Some(TailwindOptions {
+                        input,
+                        output: Some(output.clone()),
+                        version: "test-version".into(),
+                    }),
+                    ..Default::default()
+                };
+                let error = build_with(&options, cargo.as_os_str(), |tool, _| match tool {
+                    BuiltinTool::WasmBindgenCli => Ok(bindgen.clone()),
+                    BuiltinTool::TailwindCss if failure == "download" => bail!("download failed"),
+                    BuiltinTool::TailwindCss => Ok(tailwind.clone()),
+                    _ => panic!("unexpected tool"),
+                })
+                .unwrap_err();
+                assert!(format!("{error:#}").contains("Tailwind CSS"), "{error:#}");
+                assert_eq!(
+                    fs::read_to_string(&output).unwrap(),
+                    if failure == "overwrite-input" {
+                        "source CSS"
+                    } else {
+                        "previous CSS"
+                    }
+                );
+                assert_eq!(
+                    fs::read_to_string(root.join("dist/index.html")).unwrap(),
+                    "previous HTML"
+                );
+                assert!(!fs::read_dir(root).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".cargo-sycamore-tailwind-")
+                }));
             }
         }
 

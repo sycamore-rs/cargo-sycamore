@@ -16,6 +16,15 @@ const ASSET_PATH: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove
 /// Use the selected package's index.html, or the bundled default if absent.
 /// Writes only to the output directory and refuses to overwrite the source file.
 pub fn generate(project_root: &Path, out_dir: &Path, output_name: &str) -> Result<()> {
+    generate_with_stylesheet(project_root, out_dir, output_name, None)
+}
+
+pub(crate) fn generate_with_stylesheet(
+    project_root: &Path,
+    out_dir: &Path,
+    output_name: &str,
+    stylesheet: Option<&Path>,
+) -> Result<()> {
     let source = project_root.join("index.html");
     let destination = out_dir.join("index.html");
     let template = match fs::read_to_string(&source) {
@@ -36,6 +45,10 @@ pub fn generate(project_root: &Path, out_dir: &Path, output_name: &str) -> Resul
         }
     };
     let html = process(&template, output_name)?;
+    let href = stylesheet
+        .map(|path| stylesheet_href(out_dir, path))
+        .transpose()?;
+    let html = with_stylesheet(&html, href.as_deref())?;
     let mut output = tempfile::NamedTempFile::new_in(out_dir)?;
     output.write_all(html.as_bytes())?;
     #[cfg(unix)]
@@ -49,6 +62,31 @@ pub fn generate(project_root: &Path, out_dir: &Path, output_name: &str) -> Resul
         .persist(&destination)
         .with_context(|| format!("writing {}", destination.display()))?;
     Ok(())
+}
+
+fn stylesheet_href(out_dir: &Path, stylesheet: &Path) -> Result<String> {
+    let root = fs::canonicalize(out_dir).context("resolving build output directory")?;
+    let stylesheet = fs::canonicalize(stylesheet).context("resolving Tailwind CSS output")?;
+    let relative = stylesheet.strip_prefix(&root).context("Tailwind CSS output must be inside the build output directory to inject its stylesheet link")?;
+    let segments = relative
+        .iter()
+        .map(|segment| {
+            let segment = segment.to_str().context("stylesheet path is not UTF-8")?;
+            Ok(utf8_percent_encode(segment, ASSET_PATH).to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!("./{}", segments.join("/")))
+}
+
+fn with_stylesheet(template: &str, href: Option<&str>) -> Result<String> {
+    let link = href.map(|href| {
+        format!(r#"<link rel="stylesheet" href="{href}" data-cargo-sycamore-tailwind>"#)
+    });
+    replace_generated_element(
+        template,
+        link.as_deref(),
+        "link[data-cargo-sycamore-tailwind]",
+    )
 }
 
 fn process(template: &str, output_name: &str) -> Result<String> {
@@ -104,6 +142,14 @@ pub(crate) fn with_spa_base(template: &str) -> Result<String> {
 }
 
 fn append_script(template: &str, script: &str, selector: &str) -> Result<String> {
+    replace_generated_element(template, Some(script), selector)
+}
+
+fn replace_generated_element(
+    template: &str,
+    element: Option<&str>,
+    selector: &str,
+) -> Result<String> {
     // html5ever supplies implicit head/body elements and handles casing,
     // comments, and omitted closing tags without string replacement.
     let mut document = Html::parse_document(template);
@@ -114,7 +160,7 @@ fn append_script(template: &str, script: &str, selector: &str) -> Result<String>
         .context("HTML document has no head")?
         .id();
     let generated_selector = Selector::parse(selector)
-        .map_err(|_| anyhow::anyhow!("invalid generated-script selector"))?;
+        .map_err(|_| anyhow::anyhow!("invalid generated-element selector"))?;
     let previous: Vec<_> = document
         .select(&generated_selector)
         .map(|script| script.id())
@@ -123,14 +169,17 @@ fn append_script(template: &str, script: &str, selector: &str) -> Result<String>
         document
             .tree
             .get_mut(id)
-            .context("generated script missing from tree")?
+            .context("generated element missing from tree")?
             .detach();
     }
-    let fragment = Html::parse_fragment(script);
+    let Some(element) = element else {
+        return Ok(document.html());
+    };
+    let fragment = Html::parse_fragment(element);
     let script = fragment
         .select(&generated_selector)
         .next()
-        .context("could not create generated script")?;
+        .context("could not create generated element")?;
     let mut head = document
         .tree
         .get_mut(head)
@@ -161,6 +210,77 @@ mod tests {
 
     fn text(element: ElementRef<'_>) -> String {
         element.text().collect()
+    }
+
+    #[test]
+    fn generates_tailwind_link_in_head_and_replaces_only_reserved_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let out = root.join("dist");
+        fs::create_dir_all(out.join("assets")).unwrap();
+        let css = out.join("assets/my styles #%.css");
+        fs::write(&css, "body{}").unwrap();
+        let template = "<head><link rel=stylesheet href='user.css'><link rel=stylesheet href='old.css' data-cargo-sycamore-tailwind></head><body>App</body>";
+        fs::write(root.join("index.html"), template).unwrap();
+        generate_with_stylesheet(root, &out, "app", Some(&css)).unwrap();
+        let generated = fs::read_to_string(out.join("index.html")).unwrap();
+        let document = Html::parse_document(&generated);
+        assert_eq!(
+            count(&document, "head link[data-cargo-sycamore-tailwind]"),
+            1
+        );
+        assert_eq!(
+            first(&document, "link[data-cargo-sycamore-tailwind]")
+                .value()
+                .attr("href"),
+            Some("./assets/my%20styles%20%23%25.css")
+        );
+        assert_eq!(
+            first(&document, "link[data-cargo-sycamore-tailwind]")
+                .value()
+                .attr("rel"),
+            Some("stylesheet")
+        );
+        assert_eq!(count(&document, "link[href='user.css']"), 1);
+        assert_eq!(count(&document, "link[href='old.css']"), 0);
+        assert_eq!(count(&document, "script[data-cargo-sycamore]"), 1);
+        assert_eq!(
+            fs::read_to_string(root.join("index.html")).unwrap(),
+            template
+        );
+        let replaced = with_stylesheet(&generated, Some("./other.css")).unwrap();
+        assert_eq!(
+            count(
+                &Html::parse_document(&replaced),
+                "link[data-cargo-sycamore-tailwind]"
+            ),
+            1
+        );
+        generate(root, &out, "app").unwrap();
+        let disabled = Html::parse_document(&fs::read_to_string(out.join("index.html")).unwrap());
+        assert_eq!(count(&disabled, "link[data-cargo-sycamore-tailwind]"), 0);
+        assert_eq!(count(&disabled, "link[href='user.css']"), 1);
+        fs::remove_file(root.join("index.html")).unwrap();
+        generate_with_stylesheet(root, &out, "app", Some(&css)).unwrap();
+        assert_eq!(
+            count(
+                &Html::parse_document(&fs::read_to_string(out.join("index.html")).unwrap()),
+                "head link[data-cargo-sycamore-tailwind]"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_tailwind_css_outside_the_served_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("dist");
+        fs::create_dir(&out).unwrap();
+        let css = temp.path().join("outside.css");
+        fs::write(&css, "body{}").unwrap();
+        let error = generate_with_stylesheet(temp.path(), &out, "app", Some(&css)).unwrap_err();
+        assert!(format!("{error:#}").contains("inside the build output directory"));
+        assert!(!out.join("index.html").exists());
     }
 
     #[test]
