@@ -7,14 +7,10 @@
 # bin = "client"
 # example = "counter" # Select an example instead of a binary/library.
 # out-dir = "dist"
-# Optimize release builds; override with --wasm-opt=false (debug builds skip it).
-wasm-opt = true
 
 # Config-only options:
 features = []
 default-features = true
-# Pinned Binaryen release (optional override):
-# wasm-opt-version = "133"
 
 # `release` is deliberately CLI-only: use `cargo sycamore build --release`.
 
@@ -25,6 +21,11 @@ port = 8080
 autoreload = true
 # Serve index.html for missing routes; override with --spa or --spa=false.
 spa = false
+
+[tools.wasm-opt]
+# Optimize release builds; override with --wasm-opt=false (debug builds skip it).
+enable = true
+# version = "133" # Pinned Binaryen release (optional override).
 
 # Explicitly enable Tailwind for builds/watch/serve (disabled by default).
 # [tools.tailwindcss]

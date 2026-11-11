@@ -78,12 +78,12 @@ cargo sycamore s --release --wasm-opt               # Override disabled config.
 Configuration supports an enable/disable setting and a config-only version pin:
 
 ```toml
-[build]
-wasm-opt = true
-wasm-opt-version = "133"
+[tools.wasm-opt]
+enable = true
+version = "133"
 ```
 
-CLI `--wasm-opt[=true|false]` overrides `[build].wasm-opt`; omitting the flag
+CLI `--wasm-opt[=true|false]` overrides `[tools.wasm-opt].enable`; omitting the flag
 preserves the configured value (default `true`). The default Binaryen version is
 pinned to `133`, not a moving `latest` release. It uses the existing tool cache and
 platform support; for platforms without compatible Binaryen binaries, disable it
@@ -377,9 +377,17 @@ output directory and selects the release profile.
 | Features | — | `features` | `[]` |
 | Default features | — | `default-features` | `true` |
 | Release profile | `--release` | — | debug |
-| Release WASM optimization | `--wasm-opt` | `wasm-opt` | `true` (release only) |
-| Binaryen version | — | `wasm-opt-version` | `"133"` |
 | Config file | `--config` | — | nearest config source |
+
+WASM optimization settings live under `[tools.wasm-opt]`:
+
+| Option | CLI | Config key | Default |
+| --- | --- | --- | --- |
+| Enable release optimization | `--wasm-opt` | `enable` | `true` (release only) |
+| Binaryen version | — | `version` | `"133"` |
+
+The old `[build].wasm-opt` and `[build].wasm-opt-version` keys are no longer
+accepted; move them to this tools section.
 
 Server settings live under `[serve]`: `port` corresponds to the serve-only
 `--port` flag and defaults to 8080. `autoreload` corresponds to `--autoreload` and
@@ -392,7 +400,10 @@ Alternatively, use the same schema inside the package's `Cargo.toml`:
 [package.metadata.sycamore.build]
 out-dir = "dist"
 features = ["csr"]
-wasm-opt = true
+
+[package.metadata.sycamore.tools.wasm-opt]
+enable = true
+version = "133"
 
 [package.metadata.sycamore.serve]
 port = 8080
@@ -441,7 +452,7 @@ are errors. Set `default-features = false` to pass `--no-default-features` to Ca
 `src/options.rs` keeps three separate types:
 
 - `BuildArgs` / `ServeArgs`: clap CLI input, preserving absent flags as `Option` values.
-- `Config` / `BuildConfig` / `ServeConfig` / `ToolsConfig` / `TailwindConfig`: the supported TOML schema, without CLI-only fields.
+- `Config` / `BuildConfig` / `ServeConfig` / `ToolsConfig` / `WasmOptConfig` / `TailwindConfig`: the supported TOML schema, without CLI-only fields.
 - `Options`: the final merged values consumed by commands, independent
   of where each value came from.
 

@@ -33,7 +33,7 @@ pub struct BuildArgs {
     /// Build with Cargo's release profile (CLI only).
     #[arg(long)]
     pub release: bool,
-    /// Optimize release WASM with wasm-opt (default: true; ignored for debug builds).
+    /// Optimize release WASM (default: true; also [tools.wasm-opt].enable; debug builds skip it).
     #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true, action = clap::ArgAction::Set)]
     pub wasm_opt: Option<bool>,
     /// Output directory for JS/WASM bindings (also configurable in Sycamore.toml).
@@ -70,9 +70,19 @@ pub struct Config {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ToolsConfig {
     pub tailwindcss: TailwindConfig,
+    pub wasm_opt: WasmOptConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WasmOptConfig {
+    /// Defaults to true; only release builds run the optimizer.
+    pub enable: Option<bool>,
+    /// Defaults to the pinned Binaryen release.
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -115,9 +125,6 @@ pub struct BuildConfig {
     pub features: Vec<String>,
     /// Config-only setting; defaults to true when omitted.
     pub default_features: Option<bool>,
-    pub wasm_opt: Option<bool>,
-    /// Config-only Binaryen version override.
-    pub wasm_opt_version: Option<String>,
 }
 
 /// Final, merged user options. This is neither a clap parser nor a file schema:
@@ -215,6 +222,7 @@ impl Options {
             None => (None, Config::default()),
         };
         let base = config_path.as_deref().and_then(Path::parent).unwrap_or(cwd);
+        let wasm_opt = config.tools.wasm_opt;
         let tailwind = config.tools.tailwindcss;
         if !tailwind.enable
             && (tailwind.input.is_some() || tailwind.output.is_some() || tailwind.version.is_some())
@@ -268,9 +276,9 @@ impl Options {
                 .map(|p| absolute(cwd, p))
                 .or_else(|| file.out_dir.as_ref().map(|p| absolute(base, p))),
             release: args.release,
-            wasm_opt: args.wasm_opt.or(file.wasm_opt).unwrap_or(true),
-            wasm_opt_version: file
-                .wasm_opt_version
+            wasm_opt: args.wasm_opt.or(wasm_opt.enable).unwrap_or(true),
+            wasm_opt_version: wasm_opt
+                .version
                 .unwrap_or_else(|| DEFAULT_WASM_OPT_VERSION.into()),
             features: file.features,
             default_features: file.default_features.unwrap_or(true),
@@ -623,10 +631,23 @@ mod tests {
         assert!(options.wasm_opt);
         assert_eq!(options.wasm_opt_version, DEFAULT_WASM_OPT_VERSION);
         assert!(!options.release);
+        for source in ["[tools.wasm-opt]", "[tools.wasm-opt]\nversion = '123'"] {
+            fs::write(&path, source).unwrap();
+            let options = Options::resolve_in(&args, temp.path()).unwrap();
+            assert!(options.wasm_opt);
+            assert_eq!(
+                options.wasm_opt_version,
+                if source.contains("version") {
+                    "123"
+                } else {
+                    DEFAULT_WASM_OPT_VERSION
+                }
+            );
+        }
         for configured in [false, true] {
             fs::write(
                 &path,
-                format!("[build]\nwasm-opt = {configured}\nwasm-opt-version = '123'\n"),
+                format!("[tools.wasm-opt]\nenable = {configured}\nversion = '123'\n"),
             )
             .unwrap();
             args.wasm_opt = None;
@@ -639,8 +660,15 @@ mod tests {
                 !configured
             );
         }
-        assert!(toml::from_str::<Config>("[build]\nwasm-opt = 'false'").is_err());
-        assert!(toml::from_str::<Config>("[build]\nwasm-opt-version = 133").is_err());
+        for invalid in [
+            "[tools.wasm-opt]\nenable = 'false'",
+            "[tools.wasm-opt]\nversion = 133",
+            "[tools.wasm-opt]\nenabled = true",
+            "[build]\nwasm-opt = false",
+            "[build]\nwasm-opt-version = '133'",
+        ] {
+            assert!(toml::from_str::<Config>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -753,8 +781,9 @@ bin = "app"
 out-dir = "web-dist"
 features = ["csr"]
 default-features = false
-wasm-opt = false
-wasm-opt-version = "133"
+[package.metadata.sycamore.tools.wasm-opt]
+enable = false
+version = "133"
 [package.metadata.sycamore.serve]
 port = 9001
 autoreload = false
@@ -839,7 +868,8 @@ spa = true
         for metadata in [
             "unexpected = true",
             "build = false",
-            "[package.metadata.sycamore.build]\nwasm-opt = 'false'",
+            "[package.metadata.sycamore.tools.wasm-opt]\nenable = 'false'",
+            "[package.metadata.sycamore.tools.wasm-opt]\nversion = 133",
         ] {
             fs::write(&manifest, format!("[package]\nname = 'app'\nversion = '0.1.0'\n[package.metadata.sycamore]\n{metadata}\n")).unwrap();
             let error = Options::resolve_in(&BuildArgs::default(), root).unwrap_err();
