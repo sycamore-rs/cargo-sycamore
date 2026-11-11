@@ -133,6 +133,10 @@ fn build_with(
             .into_std_path_buf()
     });
     fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    let output_name = wasm
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .context("WASM artifact has no UTF-8 filename")?;
     let status = Command::new(&bindgen)
         .arg(&wasm)
         .arg("--target")
@@ -140,9 +144,16 @@ fn build_with(
         .arg("--no-typescript")
         .arg("--out-dir")
         .arg(&out_dir)
+        .arg("--out-name")
+        .arg(output_name)
         .status()
         .with_context(|| format!("running {}", bindgen.display()))?;
     ensure!(status.success(), "wasm-bindgen {version} failed ({status})");
+    let project_root = package
+        .manifest_path
+        .parent()
+        .context("manifest has no parent")?;
+    crate::html::generate(project_root.as_std_path(), &out_dir, output_name)?;
     eprintln!("Built {} → {}", package.name, out_dir.display());
     Ok(())
 }
@@ -477,6 +488,9 @@ mod tests {
             assert!(args.contains("custom-target/test_app.wasm\n"));
             assert!(args.contains("--target\nweb\n--no-typescript\n--out-dir\n"));
             assert!(root.join("dist").is_dir());
+            let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
+            assert!(html.contains("./test_app.js"));
+            assert!(args.contains("--out-name\ntest_app\n"));
         }
 
         #[test]

@@ -44,7 +44,7 @@ The build command:
 4. Automatically downloads/caches that version of `wasm-bindgen-cli` and runs
    it with `--target web` on the actual WASM artifact reported by Cargo.
 
-Generated JavaScript and WASM go into the package's `dist/` directory by default.
+Generated HTML, JavaScript, and WASM go into the package's `dist/` directory by default.
 TypeScript declarations are disabled with wasm-bindgen's `--no-typescript` flag. An explicit `--out-dir` is relative to the current
 working directory. Custom Cargo target directories are supported.
 
@@ -54,10 +54,40 @@ and path/git overrides produce an error rather than guessing an incompatible
 CLI version. Multiple versions anywhere in the workspace lockfile must currently
 be unified, even if only one is used by the selected app.
 
-Only `wasm-bindgen-cli` is downloaded by `build` for now. This is a WASM + web
-bindings build, not an HTML/CSS bundler or development server. Existing files in
-the output directory are not cleaned. Set `GITHUB_TOKEN` if needed for GitHub API
+Only `wasm-bindgen-cli` is downloaded by `build` for now. The command generates
+an HTML entrypoint and WASM web bindings, but does not bundle/copy CSS or other
+static assets or run a development server. Existing files in the output directory
+are not cleaned. Set `GITHUB_TOKEN` if needed for GitHub API
 rate limits; it is passed to the downloader for API requests only.
+
+### HTML entrypoint
+
+Every successful build writes `index.html` into the output directory. If an
+`index.html` exists beside the selected package's `Cargo.toml`, it is used as the
+template; otherwise the bundled `templates/index.html` is used. In a workspace,
+this means the selected app package's root, not necessarily the workspace root.
+
+The template is parsed as HTML5 using `scraper` (backed by `html5ever`), and a
+`<script type="module">` is appended to
+`<head>` to import the generated JavaScript and initialize WASM automatically:
+
+```html
+<script type="module" data-cargo-sycamore>
+import init from "./my_app.js";
+init().catch(error => console.error("Failed to initialize WASM:", error));
+</script>
+```
+
+The import filename matches the actual compiled WASM artifact. You don't need to
+add placeholders or write startup JavaScript. Missing `<head>`/`<body>` elements
+are supplied by the parser, and user content/scripts are preserved (formatting
+may be normalized). A previous `script[data-cargo-sycamore]` is replaced rather
+than duplicated; that marker is reserved for generated startup scripts.
+
+The source template is never overwritten. Choosing an output path that would
+overwrite it produces an error. Changes to the app's `index.html`, including its
+creation or deletion, trigger regeneration in watch mode. Serve the output using
+an HTTP server rather than opening it as a `file://` URL.
 
 ## Watching for changes
 
