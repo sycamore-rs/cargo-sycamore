@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::Args;
 use serde::Deserialize;
 
@@ -20,8 +20,11 @@ pub struct BuildArgs {
     #[arg(short, long, value_name = "PACKAGE")]
     pub package: Option<String>,
     /// Binary target to build (also configurable in Sycamore.toml).
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", conflicts_with = "example")]
     pub bin: Option<String>,
+    /// Cargo example to build and run in the browser.
+    #[arg(long, value_name = "NAME", conflicts_with = "bin")]
+    pub example: Option<String>,
     /// Build with Cargo's release profile (CLI only).
     #[arg(long)]
     pub release: bool,
@@ -67,6 +70,7 @@ pub struct BuildConfig {
     pub manifest_path: Option<PathBuf>,
     pub package: Option<String>,
     pub bin: Option<String>,
+    pub example: Option<String>,
     pub out_dir: Option<PathBuf>,
     /// Config-only Cargo feature selection.
     pub features: Vec<String>,
@@ -83,6 +87,7 @@ pub struct Options {
     pub manifest_path: Option<PathBuf>,
     pub package: Option<String>,
     pub bin: Option<String>,
+    pub example: Option<String>,
     pub out_dir: Option<PathBuf>,
     pub release: bool,
     pub features: Vec<String>,
@@ -98,6 +103,7 @@ impl Default for Options {
             manifest_path: None,
             package: None,
             bin: None,
+            example: None,
             out_dir: None,
             release: false,
             features: Vec::new(),
@@ -151,6 +157,21 @@ impl Options {
             (Config::default(), cwd)
         };
         let file = config.build;
+        ensure!(
+            args.bin.is_none() || args.example.is_none(),
+            "--bin and --example are mutually exclusive"
+        );
+        // A CLI target selector overrides the configured target selector as a
+        // group, so --example can replace a configured bin (and vice versa).
+        let (bin, example) = if args.bin.is_some() || args.example.is_some() {
+            (args.bin.clone(), args.example.clone())
+        } else {
+            (file.bin, file.example)
+        };
+        ensure!(
+            bin.is_none() || example.is_none(),
+            "configure either [build].bin or [build].example, not both"
+        );
         Ok(Self {
             manifest_path: args
                 .manifest_path
@@ -158,7 +179,8 @@ impl Options {
                 .map(|p| absolute(cwd, p))
                 .or_else(|| file.manifest_path.as_ref().map(|p| absolute(base, p))),
             package: args.package.clone().or(file.package),
-            bin: args.bin.clone().or(file.bin),
+            bin,
+            example,
             out_dir: args
                 .out_dir
                 .as_ref()
@@ -250,6 +272,42 @@ mod tests {
         args.autoreload = Some(false);
         assert!(!Options::resolve_serve(&args).unwrap().autoreload);
         assert!(toml::from_str::<Config>("[serve]\nautoreload = 'false'").is_err());
+    }
+
+    #[test]
+    fn example_selection_merges_with_cli_target_precedence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Sycamore.toml");
+        let mut args = BuildArgs {
+            config: Some(path.clone()),
+            ..Default::default()
+        };
+        fs::write(&path, "[build]\nexample = 'counter'\n").unwrap();
+        let options = Options::resolve(&args).unwrap();
+        assert_eq!(options.example.as_deref(), Some("counter"));
+        assert!(options.bin.is_none());
+        args.example = Some("other".into());
+        assert_eq!(
+            Options::resolve(&args).unwrap().example.as_deref(),
+            Some("other")
+        );
+        args.example = None;
+        args.bin = Some("client".into());
+        let options = Options::resolve(&args).unwrap();
+        assert_eq!(options.bin.as_deref(), Some("client"));
+        assert!(options.example.is_none());
+        fs::write(&path, "[build]\nbin = 'client'\n").unwrap();
+        args.bin = None;
+        args.example = Some("counter".into());
+        let options = Options::resolve(&args).unwrap();
+        assert_eq!(options.example.as_deref(), Some("counter"));
+        assert!(options.bin.is_none());
+        args.bin = Some("client".into());
+        assert!(Options::resolve(&args).is_err());
+        args.bin = None;
+        args.example = None;
+        fs::write(&path, "[build]\nbin = 'client'\nexample = 'counter'\n").unwrap();
+        assert!(Options::resolve(&args).is_err());
     }
 
     #[test]

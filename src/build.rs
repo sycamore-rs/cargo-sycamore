@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use cargo_metadata::{Message, Metadata, MetadataCommand, Package, Target};
+use cargo_metadata::{CrateType, Message, Metadata, MetadataCommand, Package, Target};
 use serde::Deserialize;
 
 use crate::{
@@ -47,7 +47,7 @@ fn build_with(
         .exec()
         .context("reading Cargo project metadata")?;
     let package = select_package(&metadata, options.package.as_deref())?;
-    let target = select_target(package, options.bin.as_deref())?;
+    let target = select_target(package, options.bin.as_deref(), options.example.as_deref())?;
 
     let mut command = Command::new(cargo);
     command
@@ -59,7 +59,9 @@ fn build_with(
         .arg("--target")
         .arg(WASM_TARGET)
         .arg("--message-format=json-render-diagnostics");
-    if target.is_bin() {
+    if target.is_example() {
+        command.arg("--example").arg(&target.name);
+    } else if target.is_bin() {
         command.arg("--bin").arg(&target.name);
     } else {
         command.arg("--lib");
@@ -198,7 +200,30 @@ fn select_package<'a>(metadata: &'a Metadata, name: Option<&str>) -> Result<&'a 
     Ok(defaults[0])
 }
 
-fn select_target<'a>(package: &'a Package, bin: Option<&str>) -> Result<&'a Target> {
+fn select_target<'a>(
+    package: &'a Package,
+    bin: Option<&str>,
+    example: Option<&str>,
+) -> Result<&'a Target> {
+    ensure!(
+        bin.is_none() || example.is_none(),
+        "--bin and --example are mutually exclusive"
+    );
+    if let Some(name) = example {
+        let target = package
+            .targets
+            .iter()
+            .find(|target| target.is_example() && target.name == name)
+            .with_context(|| format!("package '{}' has no example named '{name}'", package.name))?;
+        ensure!(
+            target
+                .crate_types
+                .iter()
+                .any(|kind| matches!(kind, CrateType::Bin | CrateType::CDyLib)),
+            "example '{name}' must have a bin or cdylib crate type to produce WASM"
+        );
+        return Ok(target);
+    }
     if let Some(name) = bin {
         return package
             .targets
@@ -213,7 +238,7 @@ fn select_target<'a>(package: &'a Package, bin: Option<&str>) -> Result<&'a Targ
     let binaries: Vec<_> = package.targets.iter().filter(|t| t.is_bin()).collect();
     ensure!(
         binaries.len() == 1,
-        "package '{}' needs a cdylib library or one binary target; use --bin <NAME> to select a binary",
+        "package '{}' needs a cdylib library or one binary target; use --bin <NAME> or --example <NAME> to select a target",
         package.name
     );
     Ok(binaries[0])
@@ -335,15 +360,18 @@ mod tests {
         let temp = fixture();
         let meta = metadata(temp.path());
         let package = select_package(&meta, None).unwrap();
-        assert_eq!(select_target(package, None).unwrap().name, "test-app");
+        assert_eq!(select_target(package, None, None).unwrap().name, "test-app");
         assert!(select_package(&meta, Some("absent")).is_err());
-        assert!(select_target(package, Some("absent")).is_err());
+        assert!(select_target(package, Some("absent"), None).is_err());
         fs::create_dir(temp.path().join("src/bin")).unwrap();
         fs::write(temp.path().join("src/bin/other.rs"), "fn main() {}\n").unwrap();
         let meta = metadata(temp.path());
         let package = select_package(&meta, None).unwrap();
-        assert!(select_target(package, None).is_err());
-        assert_eq!(select_target(package, Some("other")).unwrap().name, "other");
+        assert!(select_target(package, None, None).is_err());
+        assert_eq!(
+            select_target(package, Some("other"), None).unwrap().name,
+            "other"
+        );
         let manifest = temp.path().join("Cargo.toml");
         let contents = fs::read_to_string(&manifest).unwrap();
         fs::write(
@@ -354,10 +382,47 @@ mod tests {
         fs::write(temp.path().join("src/lib.rs"), "pub fn app() {}\n").unwrap();
         let meta = metadata(temp.path());
         assert!(
-            select_target(select_package(&meta, None).unwrap(), None)
+            select_target(select_package(&meta, None).unwrap(), None, None)
                 .unwrap()
                 .is_cdylib()
         );
+    }
+
+    #[test]
+    fn selects_named_examples_without_changing_default_targets() {
+        let temp = fixture();
+        let root = temp.path();
+        fs::create_dir_all(root.join("examples/nested")).unwrap();
+        fs::write(root.join("examples/counter.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("examples/nested/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("examples/custom.rs"), "pub fn app() {}\n").unwrap();
+        fs::write(root.join("examples/library.rs"), "pub fn app() {}\n").unwrap();
+        let manifest = root.join("Cargo.toml");
+        let original = fs::read_to_string(&manifest).unwrap();
+        fs::write(&manifest, format!("{original}\n[[example]]\nname = 'custom-name'\npath = 'examples/custom.rs'\ncrate-type = ['cdylib']\n\n[[example]]\nname = 'library'\ncrate-type = ['rlib']\n")).unwrap();
+        let meta = metadata(root);
+        let package = select_package(&meta, None).unwrap();
+        for name in ["counter", "nested", "custom-name"] {
+            assert!(
+                select_target(package, None, Some(name))
+                    .unwrap()
+                    .is_example()
+            );
+        }
+        assert!(select_target(package, None, None).unwrap().is_bin());
+        assert!(
+            select_target(package, None, Some("absent"))
+                .unwrap_err()
+                .to_string()
+                .contains("no example named")
+        );
+        assert!(
+            select_target(package, None, Some("library"))
+                .unwrap_err()
+                .to_string()
+                .contains("bin or cdylib")
+        );
+        assert!(select_target(package, Some("test-app"), Some("counter")).is_err());
     }
 
     #[test]
@@ -441,10 +506,16 @@ mod tests {
         }
 
         fn mock_cargo(root: &Path, fail: bool) -> PathBuf {
+            mock_cargo_target(root, fail, None)
+        }
+
+        fn mock_cargo_target(root: &Path, fail: bool, example: Option<&str>) -> PathBuf {
             let meta = metadata(root);
             let package = select_package(&meta, None).unwrap();
-            let target = select_target(package, None).unwrap();
-            let wasm = root.join("custom-target/test_app.wasm");
+            let target = select_target(package, None, example).unwrap();
+            let wasm = root
+                .join("custom-target")
+                .join(format!("{}.wasm", target.name.replace('-', "_")));
             fs::create_dir_all(wasm.parent().unwrap()).unwrap();
             fs::write(&wasm, b"fake wasm").unwrap();
             let artifact = serde_json::json!({
@@ -511,6 +582,42 @@ mod tests {
             let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
             assert!(html.contains("./test_app.js"));
             assert!(args.contains("--out-name\ntest_app\n"));
+        }
+
+        #[test]
+        fn builds_example_and_generates_its_entrypoint() {
+            let temp = fixture();
+            let root = temp.path();
+            fs::create_dir(root.join("examples")).unwrap();
+            fs::write(root.join("examples/counter.rs"), "fn main() {}\n").unwrap();
+            let cargo = mock_cargo_target(root, false, Some("counter"));
+            fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
+            let bindgen = root.join("wasm-bindgen");
+            script(
+                &bindgen,
+                &format!(
+                    "printf '%s\\n' \"$@\" > {}",
+                    quote(root.join("bindgen-args"))
+                ),
+            );
+            let options = Options {
+                manifest_path: Some(root.join("Cargo.toml")),
+                example: Some("counter".into()),
+                ..Default::default()
+            };
+            build_with(&options, cargo.as_os_str(), |_| Ok(bindgen)).unwrap();
+            let args = fs::read_to_string(root.join("cargo-args")).unwrap();
+            assert!(args.contains("--example\ncounter\n"));
+            assert!(!args.contains("--bin\n"));
+            assert!(!args.contains("--lib\n"));
+            let args = fs::read_to_string(root.join("bindgen-args")).unwrap();
+            assert!(args.contains("custom-target/counter.wasm\n"));
+            assert!(args.contains("--out-name\ncounter\n"));
+            assert!(
+                fs::read_to_string(root.join("dist/index.html"))
+                    .unwrap()
+                    .contains("./counter.js")
+            );
         }
 
         #[test]

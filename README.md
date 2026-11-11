@@ -89,6 +89,41 @@ overwrite it produces an error. Changes to the app's `index.html`, including its
 creation or deletion, trigger regeneration in watch mode. Serve the output using
 an HTTP server rather than opening it as a `file://` URL.
 
+### Running Cargo examples
+
+Use `--example <NAME>` to build, watch, or serve a Cargo example in the browser:
+
+```sh
+cargo sycamore build --example counter
+cargo sycamore w --example counter
+cargo sycamore s --example counter
+cargo sycamore s --package my-app --example counter --release
+```
+
+Examples are selected by Cargo target name: `examples/counter.rs`,
+`examples/counter/main.rs`, or a custom `[[example]]` target in `Cargo.toml`.
+Binary and `cdylib` examples are supported; Rust-only library example crate types
+cannot produce the required WASM executable. Example dev-dependencies are handled
+by Cargo, and required features can be enabled with `[build].features`.
+
+You can also select an example in `Sycamore.toml`:
+
+```toml
+[build]
+example = "counter"
+```
+
+`--bin` and `--example` are mutually exclusive, as are their config equivalents.
+An explicit CLI target selector overrides the configured target selector, so
+`--example counter` can replace a configured `bin` and `--bin client` can replace
+a configured `example`. Without an example selection, normal library/binary target
+selection is unchanged.
+
+Examples use the same package-root `index.html` template and default package
+`dist/` output as normal builds. Use `--out-dir` to keep separate outputs when
+switching targets. `serve --example` includes watching and browser autoreload
+according to your usual serve settings.
+
 ## Watching for changes
 
 ```sh
@@ -213,6 +248,7 @@ output directory and selects the release profile.
 | Manifest | `--manifest-path` | `manifest-path` | Cargo's current project |
 | Package | `--package` / `-p` | `package` | Cargo's default members |
 | Binary | `--bin` | `bin` | cdylib or sole binary |
+| Example | `--example` | `example` | none |
 | Output | `--out-dir` | `out-dir` | `<package>/dist` |
 | Features | — | `features` | `[]` |
 | Default features | — | `default-features` | `true` |

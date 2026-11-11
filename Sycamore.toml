@@ -5,6 +5,7 @@
 # manifest-path = "Cargo.toml"
 # package = "my-app"
 # bin = "client"
+# example = "counter" # Select an example instead of a binary/library.
 # out-dir = "dist"
 
 # Config-only options:

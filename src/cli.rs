@@ -144,6 +144,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_examples_for_build_watch_and_serve() {
+        for command in ["build", "b", "watch", "w", "serve", "s"] {
+            let cli = parse(&[
+                "cargo-sycamore",
+                "sycamore",
+                command,
+                "--example",
+                "counter",
+                "--release",
+            ])
+            .unwrap();
+            let args = match cli.command {
+                Command::Build(args) | Command::Watch(args) => args,
+                Command::Serve(args) => args.build,
+                _ => panic!("unexpected command"),
+            };
+            assert_eq!(args.example.as_deref(), Some("counter"));
+            assert!(args.release);
+            assert!(
+                parse(&[
+                    "cargo-sycamore",
+                    command,
+                    "--bin",
+                    "client",
+                    "--example",
+                    "counter"
+                ])
+                .is_err()
+            );
+            assert!(parse(&["cargo-sycamore", command, "--example"]).is_err());
+        }
+    }
+
+    #[test]
     fn parses_autoreload_without_overriding_config_when_flag_is_absent() {
         for (flag, expected) in [
             ("--autoreload", true),
