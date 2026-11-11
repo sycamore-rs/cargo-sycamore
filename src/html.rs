@@ -65,9 +65,10 @@ pub(crate) fn generate_with_stylesheet(
 }
 
 fn stylesheet_href(out_dir: &Path, stylesheet: &Path) -> Result<String> {
-    let root = fs::canonicalize(out_dir).context("resolving build output directory")?;
-    let stylesheet = fs::canonicalize(stylesheet).context("resolving Tailwind CSS output")?;
-    let relative = stylesheet.strip_prefix(&root).context("Tailwind CSS output must be inside the build output directory to inject its stylesheet link")?;
+    // Build output is already resolved from a validated relative asset path.
+    let relative = stylesheet
+        .strip_prefix(out_dir)
+        .context("invalid generated stylesheet path")?;
     let segments = relative
         .iter()
         .map(|segment| {
@@ -272,14 +273,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tailwind_css_outside_the_served_output() {
+    fn rejects_invalid_generated_stylesheet_paths() {
         let temp = tempfile::tempdir().unwrap();
         let out = temp.path().join("dist");
         fs::create_dir(&out).unwrap();
         let css = temp.path().join("outside.css");
         fs::write(&css, "body{}").unwrap();
         let error = generate_with_stylesheet(temp.path(), &out, "app", Some(&css)).unwrap_err();
-        assert!(format!("{error:#}").contains("inside the build output directory"));
+        assert!(format!("{error:#}").contains("invalid generated stylesheet path"));
         assert!(!out.join("index.html").exists());
     }
 

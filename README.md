@@ -106,7 +106,7 @@ Enable the standalone Tailwind CSS compiler explicitly in `Sycamore.toml`:
 enable = true
 input = "styles/input.css"
 # Optional: defaults to index.css inside the resolved build output directory.
-output = "dist/index.css"
+output = "index.css"
 # Optional: pinned default, not a moving latest release.
 version = "4.3.5"
 ```
@@ -126,12 +126,13 @@ input = "styles/input.css"
   link from subsequent HTML output.
 - The default input is `index.css` beside the selected config file or manifest.
   Create the input file; for Tailwind v4, start with `@import "tailwindcss";`.
-- Explicit input/output paths are relative to the config file (or metadata's
-  `Cargo.toml`), not the invocation directory. Absolute paths are preserved.
-- An omitted output follows `--out-dir` / `[build].out-dir` and defaults to
-  `<package>/dist/index.css`. An explicit output is used as-is, independently
-  of the build output directory. It must lie inside the resolved build output
-  directory so the generated HTML can reference a servable stylesheet.
+- Input paths are relative to the config file (or metadata's `Cargo.toml`), not
+  the invocation directory. Absolute input paths are preserved.
+- Output paths are always relative to the resolved build output directory and
+  default to `index.css`. For example, `output = "output.css"` writes
+  `dist/output.css`; `output = "assets/site.css"` writes `dist/assets/site.css`.
+  Both follow `--out-dir` / `[build].out-dir` overrides automatically. Absolute
+  output paths and `..` components are rejected; do not include the `dist/` prefix.
 - Version defaults to **4.3.5**. The matching standalone executable is downloaded
   through the normal tool cache, so npm/Node installation is not required.
 - The compiler runs once for each successful Cargo/wasm-bindgen build, including

@@ -171,13 +171,6 @@ impl WatchPlan {
         if let Some(output) = &options.out_dir {
             ignored.insert(normalize(&std::path::absolute(output)?));
         }
-        if let Some(output) = options
-            .tailwindcss
-            .as_ref()
-            .and_then(|config| config.output.as_ref())
-        {
-            ignored.insert(normalize(&std::path::absolute(output)?));
-        }
         for output in &ignored {
             ensure!(
                 !workspace.starts_with(output),
@@ -452,7 +445,7 @@ mod tests {
             manifest_path: Some(project.join("Cargo.toml")),
             tailwindcss: Some(crate::options::TailwindOptions {
                 input: external.join("input.css"),
-                output: Some(project.join("assets/site.css")),
+                output: Some(PathBuf::from("assets/site.css")),
                 version: "test-version".into(),
             }),
             ..Default::default()
@@ -460,7 +453,7 @@ mod tests {
         let plan = WatchPlan::new(&options).unwrap();
         assert!(plan.roots.iter().any(|(path, _)| *path == external));
         assert!(plan.relevant_path(&external.join("input.css")));
-        assert!(!plan.relevant_path(&project.join("assets/site.css")));
+        assert!(!plan.relevant_path(&project.join("dist/assets/site.css")));
     }
 
     fn event(kind: EventKind, path: PathBuf) -> Event {

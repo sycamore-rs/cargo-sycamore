@@ -31,5 +31,5 @@ enable = true
 # [tools.tailwindcss]
 # enable = true
 # input = "index.css" # Default; relative to this config file.
-# output = "dist/index.css" # Omit to follow the build output directory.
+# output = "index.css" # Relative to the build output directory (dist by default).
 # version = "4.3.5" # Pinned default.

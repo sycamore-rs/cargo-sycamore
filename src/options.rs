@@ -99,7 +99,7 @@ pub struct TailwindConfig {
 #[derive(Debug)]
 pub struct TailwindOptions {
     pub input: PathBuf,
-    /// None defaults to index.css in the selected build output directory.
+    /// Relative to the selected build output directory; defaults to index.css.
     pub output: Option<PathBuf>,
     pub version: String,
 }
@@ -125,6 +125,22 @@ pub struct BuildConfig {
     pub features: Vec<String>,
     /// Config-only setting; defaults to true when omitted.
     pub default_features: Option<bool>,
+}
+
+impl TailwindOptions {
+    pub(crate) fn output_path(&self, out_dir: &Path) -> Result<PathBuf> {
+        let path = self.output.as_deref().unwrap_or(Path::new("index.css"));
+        ensure!(
+            path.components()
+                .any(|part| matches!(part, std::path::Component::Normal(_)))
+                && path.components().all(|part| matches!(
+                    part,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )),
+            "tools.tailwindcss.output must be a relative path without '..' components"
+        );
+        Ok(out_dir.join(path))
+    }
 }
 
 /// Final, merged user options. This is neither a clap parser nor a file schema:
@@ -237,7 +253,7 @@ impl Options {
                     base,
                     tailwind.input.as_deref().unwrap_or(Path::new("index.css")),
                 ),
-                output: tailwind.output.as_ref().map(|path| absolute(base, path)),
+                output: tailwind.output,
                 version: tailwind
                     .version
                     .unwrap_or_else(|| DEFAULT_TAILWINDCSS_VERSION.into()),
@@ -245,6 +261,9 @@ impl Options {
         } else {
             None
         };
+        if let Some(tailwind) = &tailwindcss {
+            tailwind.output_path(Path::new("."))?;
+        }
         let file = config.build;
         ensure!(
             args.bin.is_none() || args.example.is_none(),
@@ -571,7 +590,7 @@ mod tests {
                 tailwind.output,
                 setting
                     .starts_with("output")
-                    .then(|| base.join("public/app.css"))
+                    .then(|| PathBuf::from("public/app.css"))
             );
             assert_eq!(
                 tailwind.version,
@@ -594,8 +613,7 @@ mod tests {
         }
         let absolute = temp.path().join("absolute.css");
         let config = format!(
-            "[tools.tailwindcss]\nenable = true\ninput = {}\noutput = {}\n",
-            toml::Value::String(absolute.to_string_lossy().into_owned()),
+            "[tools.tailwindcss]\nenable = true\ninput = {}\noutput = 'site.css'\n",
             toml::Value::String(absolute.to_string_lossy().into_owned())
         );
         fs::write(&path, config).unwrap();
@@ -604,17 +622,25 @@ mod tests {
             .tailwindcss
             .unwrap();
         assert_eq!(tailwind.input, absolute);
-        assert_eq!(tailwind.output, Some(absolute));
+        assert_eq!(tailwind.output, Some(PathBuf::from("site.css")));
+        for output in [absolute, PathBuf::from("../outside.css")] {
+            let config = format!(
+                "[tools.tailwindcss]\nenable = true\noutput = {}\n",
+                toml::Value::String(output.to_string_lossy().into_owned())
+            );
+            fs::write(&path, config).unwrap();
+            assert!(Options::resolve_in(&args, temp.path()).is_err());
+        }
     }
 
     #[test]
     fn tailwind_configuration_is_also_supported_in_cargo_metadata() {
         let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("Cargo.toml"), "[package]\nname = 'app'\nversion = '0.1.0'\n[package.metadata.sycamore.tools.tailwindcss]\nenable = true\ninput = 'styles.css'\noutput = 'dist/site.css'\nversion = '4.0.0'\n").unwrap();
+        fs::write(temp.path().join("Cargo.toml"), "[package]\nname = 'app'\nversion = '0.1.0'\n[package.metadata.sycamore.tools.tailwindcss]\nenable = true\ninput = 'styles.css'\noutput = 'site.css'\nversion = '4.0.0'\n").unwrap();
         let options = Options::resolve_in(&BuildArgs::default(), temp.path()).unwrap();
         let tailwind = options.tailwindcss.unwrap();
         assert_eq!(tailwind.input, temp.path().join("styles.css"));
-        assert_eq!(tailwind.output, Some(temp.path().join("dist/site.css")));
+        assert_eq!(tailwind.output, Some(PathBuf::from("site.css")));
         assert_eq!(tailwind.version, "4.0.0");
     }
 

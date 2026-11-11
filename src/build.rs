@@ -246,10 +246,7 @@ fn compile_tailwind(
     out_dir: &Path,
     release: bool,
 ) -> Result<PathBuf> {
-    let output = config
-        .output
-        .clone()
-        .unwrap_or_else(|| out_dir.join("index.css"));
+    let output = config.output_path(out_dir)?;
     let input = fs::canonicalize(&config.input).context("resolving Tailwind CSS input")?;
     ensure!(
         fs::canonicalize(&output).ok().as_ref() != Some(&input),
@@ -874,10 +871,8 @@ mod tests {
                     ),
                 );
                 let out = root.join("custom-dist");
-                let explicit_output = release.then(|| out.join("assets/nested/styles.css"));
-                let output = explicit_output
-                    .clone()
-                    .unwrap_or_else(|| out.join("index.css"));
+                let explicit_output = release.then(|| PathBuf::from("assets/nested/styles.css"));
+                let output = out.join(explicit_output.as_deref().unwrap_or(Path::new("index.css")));
                 let options = Options {
                     manifest_path: Some(root.join("Cargo.toml")),
                     out_dir: Some(out.clone()),
@@ -955,19 +950,23 @@ mod tests {
                 let root = temp.path();
                 let cargo = mock_cargo(root, false);
                 fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
-                let input = root.join("input.css");
+                fs::create_dir(root.join("dist")).unwrap();
+                let input = if failure == "overwrite-input" {
+                    root.join("dist/input.css")
+                } else {
+                    root.join("input.css")
+                };
                 if failure != "missing-input" {
                     fs::write(&input, "source CSS").unwrap();
                 }
                 let output = if failure == "overwrite-input" {
                     input.clone()
                 } else {
-                    root.join("styles.css")
+                    root.join("dist/styles.css")
                 };
                 if failure != "overwrite-input" {
                     fs::write(&output, "previous CSS").unwrap();
                 }
-                fs::create_dir(root.join("dist")).unwrap();
                 fs::write(root.join("dist/index.html"), "previous HTML").unwrap();
                 let bindgen = root.join("wasm-bindgen");
                 script(&bindgen, "exit 0");
@@ -979,7 +978,7 @@ mod tests {
                     manifest_path: Some(root.join("Cargo.toml")),
                     tailwindcss: Some(TailwindOptions {
                         input,
-                        output: Some(output.clone()),
+                        output: Some(output.strip_prefix(root.join("dist")).unwrap().to_owned()),
                         version: "test-version".into(),
                     }),
                     ..Default::default()
