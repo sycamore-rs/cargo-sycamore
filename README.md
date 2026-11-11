@@ -12,6 +12,12 @@ cargo sycamore --help
 cargo sycamore --version
 ```
 
+For prebuilt binaries from GitHub releases, install with:
+
+```sh
+cargo binstall cargo-sycamore
+```
+
 ## Usage
 
 See [USAGE.md](USAGE.md) for build, watch, and development-server workflows,

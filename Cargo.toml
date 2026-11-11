@@ -7,6 +7,11 @@ license = "MIT"
 repository = "https://github.com/sycamore-rs/cargo-sycamore"
 homepage = "https://sycamore.dev"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/{ version }/{ name }-{ target }-{ version }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [dependencies]
 anyhow = "1"
 cargo_metadata = "0.23"

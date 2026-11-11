@@ -18,16 +18,10 @@ jobs:
         include:
           - platform: linux
             os: ubuntu-latest
-            binary: cargo-sycamore
-            asset: cargo-sycamore-linux
           - platform: macos
             os: macos-latest
-            binary: cargo-sycamore
-            asset: cargo-sycamore-macos
           - platform: windows
             os: windows-latest
-            binary: cargo-sycamore.exe
-            asset: cargo-sycamore-windows.exe
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -38,17 +32,28 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Prepare release asset
+      - name: Package release archive
+        id: package
         shell: bash
         run: |
+          target="$(rustc -vV | sed -n 's/^host: //p')"
+          version="${GITHUB_REF_NAME}"
+          binary="cargo-sycamore"
+          case "$target" in
+            *windows*) binary="${binary}.exe" ;;
+          esac
+
+          archive="cargo-sycamore-${target}-${version}.tgz"
+          tar -czf "$archive" -C target/release "$binary"
           mkdir -p dist
-          cp "target/release/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+          mv "$archive" dist/
+          echo "asset=${archive}" >> "$GITHUB_OUTPUT"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          name: ${{ steps.package.outputs.asset }}
+          path: dist/${{ steps.package.outputs.asset }}
           if-no-files-found: error
 
   publish:
@@ -68,7 +73,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: dist/*
+          files: dist/*.tgz
           fail_on_unmatched_files: true
           generate_release_notes: true
         env:
