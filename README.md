@@ -32,7 +32,8 @@ cargo sycamore build --package my-app --bin client --out-dir public
 cargo sycamore build --help
 ```
 
-Settings can also come from `Sycamore.toml`; see [Configuration](#configuration).
+Settings can also come from `Sycamore.toml` or `[package.metadata.sycamore]` in
+`Cargo.toml`; see [Configuration](#configuration).
 
 The build command:
 
@@ -316,26 +317,51 @@ output directory and selects the release profile.
 | Release profile | `--release` | — | debug |
 | Release WASM optimization | `--wasm-opt` | `wasm-opt` | `true` (release only) |
 | Binaryen version | — | `wasm-opt-version` | `"133"` |
-| Config file | `--config` | — | nearest `Sycamore.toml` |
+| Config file | `--config` | — | nearest config source |
 
 Server settings live under `[serve]`: `port` corresponds to the serve-only
 `--port` flag and defaults to 8080. `autoreload` corresponds to `--autoreload` and
 defaults to `true`. Both CLI overrides preserve config values when omitted.
 `spa` corresponds to the serve-only `--spa` flag and defaults to `false`.
 
+Alternatively, use the same schema inside the package's `Cargo.toml`:
+
+```toml
+[package.metadata.sycamore.build]
+out-dir = "dist"
+features = ["csr"]
+wasm-opt = true
+
+[package.metadata.sycamore.serve]
+port = 8080
+spa = true
+```
+
+The `build` and `serve` tables are nested under `package.metadata.sycamore`;
+all settings and validation rules are the same as in `Sycamore.toml`. Relative
+paths in metadata are relative to the directory containing that `Cargo.toml`.
+Changes to the selected manifest are picked up by watch/serve just like changes
+to a standalone config.
+
 Configuration is optional. An explicit `--config path/to/Sycamore.toml` selects
 that file and bypasses automatic discovery (a missing explicit file is an error).
 Otherwise:
 
 - With CLI `--package <NAME>`, Cargo metadata locates that workspace package and
-  discovery starts at its root. A package-local `Sycamore.toml` is preferred;
-  without one, ancestor configs (such as the workspace's) are considered.
+  discovery starts at its root, allowing that package's standalone config or
+  Cargo metadata to take precedence over ancestor configs.
 - Without `--package`, discovery starts in the directory containing the
   CLI-supplied `--manifest-path`, or the current directory when it is absent.
 
-Discovery searches upward for the nearest `Sycamore.toml`. Only that file is
-loaded; parent and child files are not layered, and CLI options still override
-its values. Package discovery uses the CLI manifest path or current Cargo project;
+At each directory, discovery checks `Sycamore.toml` first, then
+`[package.metadata.sycamore]` in `Cargo.toml`, before searching the parent.
+If both sources exist in the same directory, a warning identifies the selected
+standalone file and the ignored metadata. Ignored metadata is not validated as
+Sycamore configuration. A manifest without Sycamore metadata does not stop the
+search. Only one source is loaded; sources are not layered, and CLI options still
+override its values. A virtual workspace does not automatically search its members;
+use `--package` to select a member's config. Package discovery uses the CLI manifest
+path or current Cargo project;
 a package set inside a config does not trigger another round of discovery.
 Unknown packages and malformed selected configs are errors, not reasons to fall
 back to another config.

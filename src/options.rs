@@ -37,7 +37,7 @@ pub struct BuildArgs {
     /// Output directory for JS/WASM bindings (also configurable in Sycamore.toml).
     #[arg(long, value_name = "PATH")]
     pub out_dir: Option<PathBuf>,
-    /// Explicit config file; otherwise search for Sycamore.toml in parent directories.
+    /// Explicit config file; otherwise discover Sycamore.toml or Cargo package metadata.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 }
@@ -58,7 +58,7 @@ pub struct ServeArgs {
     pub spa: Option<bool>,
 }
 
-/// File input only. CLI-only settings intentionally cannot be deserialized.
+/// Config-file/manifest input only. CLI-only settings cannot be deserialized.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -96,7 +96,7 @@ pub struct BuildConfig {
 /// commands do not need to know which source supplied a value.
 #[derive(Debug)]
 pub struct Options {
-    /// Configuration file used during resolution, if any (for watch mode).
+    /// Selected configuration source (Sycamore.toml or Cargo.toml), for watch mode.
     pub config_path: Option<PathBuf>,
     pub manifest_path: Option<PathBuf>,
     pub package: Option<String>,
@@ -160,8 +160,13 @@ impl Options {
     }
 
     fn resolve_in(args: &BuildArgs, cwd: &Path) -> Result<Self> {
-        let config_path = match &args.config {
-            Some(path) => Some(absolute(cwd, path)),
+        let selected = match &args.config {
+            Some(path) => {
+                let path = absolute(cwd, path);
+                let config = read_config(&path)?;
+                warn_duplicate_config(&path);
+                Some((path, config))
+            }
             None => {
                 let start = if let Some(package) = &args.package {
                     package_directory(args, cwd, package)?
@@ -175,19 +180,11 @@ impl Options {
                 discover(&start)?
             }
         };
-        let (config, base) = if let Some(path) = &config_path {
-            let contents = fs::read_to_string(path)
-                .with_context(|| format!("reading configuration {}", path.display()))?;
-            let config: Config = toml::from_str(&contents)
-                .with_context(|| format!("parsing configuration {}", path.display()))?;
-            (
-                config,
-                path.parent()
-                    .context("config file has no parent directory")?,
-            )
-        } else {
-            (Config::default(), cwd)
+        let (config_path, config) = match selected {
+            Some((path, config)) => (Some(path), config),
+            None => (None, Config::default()),
         };
+        let base = config_path.as_deref().and_then(Path::parent).unwrap_or(cwd);
         let file = config.build;
         ensure!(
             args.bin.is_none() || args.example.is_none(),
@@ -268,16 +265,74 @@ fn package_directory(args: &BuildArgs, cwd: &Path, name: &str) -> Result<PathBuf
         .into_std_path_buf())
 }
 
-fn discover(start: &Path) -> Result<Option<PathBuf>> {
+fn read_config(path: &Path) -> Result<Config> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("reading configuration {}", path.display()))?;
+    toml::from_str(&contents).with_context(|| format!("parsing configuration {}", path.display()))
+}
+
+fn manifest_metadata(path: &Path) -> Result<Option<toml::Value>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading manifest {}", path.display()));
+        }
+    };
+    let manifest: toml::Value = toml::from_str(&contents)
+        .with_context(|| format!("parsing manifest {}", path.display()))?;
+    Ok(manifest
+        .get("package")
+        .and_then(|package| package.get("metadata"))
+        .and_then(|metadata| metadata.get("sycamore"))
+        .cloned())
+}
+
+fn manifest_config(path: &Path) -> Result<Option<Config>> {
+    manifest_metadata(path)?
+        .map(|value| {
+            value.try_into().with_context(|| {
+                format!("parsing [package.metadata.sycamore] in {}", path.display())
+            })
+        })
+        .transpose()
+}
+
+fn warn_duplicate_config(path: &Path) {
+    let Some(directory) = path.parent() else {
+        return;
+    };
+    let manifest = directory.join("Cargo.toml");
+    // This source is ignored, so even malformed metadata must not invalidate
+    // the selected standalone file. Read only enough to detect its presence.
+    if matches!(manifest_metadata(&manifest), Ok(Some(_))) {
+        eprintln!(
+            "warning: found both {} and [package.metadata.sycamore] in {}; using {} and ignoring Cargo metadata (configuration sources are not merged)",
+            path.display(),
+            manifest.display(),
+            path.display()
+        );
+    }
+}
+
+fn discover(start: &Path) -> Result<Option<(PathBuf, Config)>> {
     for directory in start.ancestors() {
         let path = directory.join("Sycamore.toml");
         match fs::metadata(&path) {
-            Ok(_) => return Ok(Some(path)),
+            Ok(_) => {
+                let config = read_config(&path)?;
+                warn_duplicate_config(&path);
+                return Ok(Some((path, config)));
+            }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("checking configuration {}", path.display()));
             }
+        }
+        let manifest = directory.join("Cargo.toml");
+        if let Some(config) = manifest_config(&manifest)? {
+            return Ok(Some((manifest, config)));
         }
     }
     Ok(None)
@@ -522,6 +577,135 @@ mod tests {
         fs::remove_file(member.join("Sycamore.toml")).unwrap();
         let options = Options::resolve_in(&args, temp.path()).unwrap();
         assert_eq!(options.package.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn reads_manifest_metadata_and_resolves_paths_from_the_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let cwd = root.join("src");
+        fs::create_dir(&cwd).unwrap();
+        let manifest = root.join("Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"
+[package]
+name = "app"
+version = "0.1.0"
+[package.metadata.unrelated]
+anything = true
+[package.metadata.sycamore.build]
+bin = "app"
+out-dir = "web-dist"
+features = ["csr"]
+default-features = false
+wasm-opt = false
+wasm-opt-version = "133"
+[package.metadata.sycamore.serve]
+port = 9001
+autoreload = false
+spa = true
+"#,
+        )
+        .unwrap();
+        let options = Options::resolve_in(&BuildArgs::default(), &cwd).unwrap();
+        assert_eq!(options.config_path, Some(manifest.clone()));
+        assert_eq!(options.out_dir, Some(root.join("web-dist")));
+        assert_eq!(options.bin.as_deref(), Some("app"));
+        assert_eq!(options.features, ["csr"]);
+        assert!(!options.default_features);
+        assert!(!options.wasm_opt);
+        assert_eq!(options.wasm_opt_version, "133");
+        assert_eq!(options.port, 9001);
+        assert!(!options.autoreload);
+        assert!(options.spa);
+        let args = BuildArgs {
+            manifest_path: Some(manifest),
+            out_dir: Some("cli-dist".into()),
+            wasm_opt: Some(true),
+            example: Some("counter".into()),
+            ..Default::default()
+        };
+        let options = Options::resolve_in(&args, &cwd).unwrap();
+        assert_eq!(options.out_dir, Some(cwd.join("cli-dist")));
+        assert!(options.wasm_opt);
+        assert!(options.bin.is_none());
+        assert_eq!(options.example.as_deref(), Some("counter"));
+    }
+
+    #[test]
+    fn nearest_package_metadata_wins_over_ancestor_config_but_not_local_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        package_workspace(root);
+        fs::write(
+            root.join("Sycamore.toml"),
+            "[build]\nfeatures = ['root']\n[serve]\nspa = true\n",
+        )
+        .unwrap();
+        let member = root.join("apps/frontend");
+        let manifest = member.join("Cargo.toml");
+        let original = fs::read_to_string(&manifest).unwrap();
+        fs::write(
+            &manifest,
+            format!("{original}\n[package.metadata.sycamore.build]\nout-dir = 'metadata-dist'\n"),
+        )
+        .unwrap();
+        let args = BuildArgs {
+            package: Some("frontend".into()),
+            ..Default::default()
+        };
+        let options = Options::resolve_in(&args, root).unwrap();
+        assert_eq!(options.config_path, Some(manifest.clone()));
+        assert_eq!(options.out_dir, Some(member.join("metadata-dist")));
+        assert!(options.features.is_empty(), "sources are not merged");
+        assert!(!options.spa);
+        let file = member.join("Sycamore.toml");
+        fs::write(&file, "[serve]\nport = 9002\n").unwrap();
+        let options = Options::resolve_in(&args, root).unwrap();
+        assert_eq!(options.config_path, Some(file.clone()));
+        assert!(
+            options.out_dir.is_none(),
+            "local file replaces metadata completely"
+        );
+        assert_eq!(options.port, 9002);
+        fs::remove_file(file).unwrap();
+        fs::write(manifest, original).unwrap();
+        assert_eq!(
+            Options::resolve_in(&args, root).unwrap().config_path,
+            Some(root.join("Sycamore.toml"))
+        );
+    }
+
+    #[test]
+    fn malformed_metadata_is_an_error_unless_discovery_is_overridden() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let manifest = root.join("Cargo.toml");
+        for metadata in [
+            "unexpected = true",
+            "build = false",
+            "[package.metadata.sycamore.build]\nwasm-opt = 'false'",
+        ] {
+            fs::write(&manifest, format!("[package]\nname = 'app'\nversion = '0.1.0'\n[package.metadata.sycamore]\n{metadata}\n")).unwrap();
+            let error = Options::resolve_in(&BuildArgs::default(), root).unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains("package.metadata.sycamore"), "{error}");
+            assert!(error.contains("Cargo.toml"), "{error}");
+        }
+        // The same-directory file wins, even if ignored metadata is invalid.
+        fs::write(root.join("Sycamore.toml"), "[serve]\nspa = true\n").unwrap();
+        assert!(
+            Options::resolve_in(&BuildArgs::default(), root)
+                .unwrap()
+                .spa
+        );
+        fs::write(&manifest, "invalid [manifest").unwrap();
+        let args = BuildArgs {
+            config: Some("Sycamore.toml".into()),
+            ..Default::default()
+        };
+        assert!(Options::resolve_in(&args, root).unwrap().spa);
     }
 
     fn package_workspace(root: &Path) {
