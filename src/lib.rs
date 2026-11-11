@@ -3,3 +3,4 @@
 pub mod build;
 pub mod options;
 pub mod tools;
+pub mod watch;

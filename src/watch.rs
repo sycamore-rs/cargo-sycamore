@@ -1,0 +1,393 @@
+//! Debounced filesystem watching with serialized builds and generated-file exclusions.
+
+use std::{
+    collections::BTreeSet,
+    path::{Component, Path, PathBuf},
+    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, ensure};
+use cargo_metadata::MetadataCommand;
+use notify::{Event, EventKind, RecursiveMode, Watcher, event::ModifyKind};
+
+use crate::{
+    build,
+    options::{BuildArgs, Options},
+};
+
+const DEBOUNCE: Duration = Duration::from_millis(250);
+type WatchEvent = notify::Result<Event>;
+
+/// Build immediately, then rebuild on workspace/config changes until interrupted.
+/// Build/config errors are reported without stopping the watcher. Watcher errors
+/// are fatal, since otherwise we could silently miss future changes.
+pub fn watch(args: &BuildArgs) -> Result<()> {
+    let options = Options::resolve(args)?;
+    let mut plan = WatchPlan::new(&options)?;
+    let (sender, receiver) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = sender.send(event);
+    })
+    .context("creating filesystem watcher")?;
+    set_watches(&mut watcher, &[], &plan.roots)?;
+    eprintln!("Watching {} (Ctrl-C to stop)", plan.workspace.display());
+    // Install watches before building so edits during a build aren't lost.
+    report_build(&options);
+    loop {
+        wait_for_change(&receiver, &plan, DEBOUNCE)?;
+        // Reload file configuration on every rebuild, including changes to the
+        // manifest/output paths. Keep the existing watches if resolution fails.
+        let resolved = Options::resolve(args).and_then(|options| {
+            let next = WatchPlan::new(&options)?;
+            Ok((options, next))
+        });
+        match resolved {
+            Ok((options, next)) => {
+                set_watches(&mut watcher, &plan.roots, &next.roots)?;
+                plan = next;
+                eprintln!("Change detected; rebuilding...");
+                report_build(&options);
+            }
+            Err(error) => eprintln!("error: {error:#}\nWaiting for changes..."),
+        }
+    }
+}
+
+fn report_build(options: &Options) {
+    if let Err(error) = build::build(options) {
+        eprintln!("error: {error:#}\nWaiting for changes...");
+    }
+}
+
+#[derive(Debug)]
+struct WatchPlan {
+    workspace: PathBuf,
+    config: Option<PathBuf>,
+    ignored: Vec<PathBuf>,
+    roots: Vec<(PathBuf, RecursiveMode)>,
+}
+
+impl WatchPlan {
+    fn new(options: &Options) -> Result<Self> {
+        let mut command = MetadataCommand::new();
+        command.no_deps();
+        if let Some(cargo) = std::env::var_os("CARGO") {
+            command.cargo_path(cargo);
+        }
+        if let Some(manifest) = &options.manifest_path {
+            command.manifest_path(manifest);
+        }
+        let metadata = command
+            .exec()
+            .context("reading Cargo workspace for watching")?;
+        let workspace = normalize(metadata.workspace_root.as_std_path());
+        let mut ignored = BTreeSet::new();
+        ignored.insert(normalize(metadata.target_directory.as_std_path()));
+        // Exclude generated output for all members, not just the selected one.
+        for package in metadata.workspace_packages() {
+            if let Some(parent) = package.manifest_path.parent() {
+                ignored.insert(normalize(parent.join("dist").as_std_path()));
+            }
+        }
+        if let Some(output) = &options.out_dir {
+            ignored.insert(normalize(&std::path::absolute(output)?));
+        }
+        for output in &ignored {
+            ensure!(
+                !workspace.starts_with(output),
+                "watch output/target directory '{}' contains the workspace; use a separate output directory",
+                output.display()
+            );
+        }
+        let config = options.config_path.as_ref().map(|p| normalize(p));
+        let mut roots = vec![(workspace.clone(), RecursiveMode::Recursive)];
+        if let Some(parent) = config.as_deref().and_then(Path::parent)
+            && !parent.starts_with(&workspace)
+        {
+            // Watching the parent rather than the file handles atomic-save
+            // editors which replace the inode on each save.
+            roots.push((parent.to_owned(), RecursiveMode::NonRecursive));
+        }
+        Ok(Self {
+            workspace,
+            config,
+            ignored: ignored.into_iter().collect(),
+            roots,
+        })
+    }
+
+    fn relevant(&self, event: &Event) -> bool {
+        // Backends may report queue overflow without paths; rebuild conservatively.
+        if event.need_rescan() {
+            return true;
+        }
+        if !matches!(
+            event.kind,
+            EventKind::Create(_)
+                | EventKind::Remove(_)
+                | EventKind::Modify(ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Name(_))
+                | EventKind::Any
+        ) {
+            return false;
+        }
+        event.paths.iter().any(|path| {
+            let path = normalize(path);
+            if self.config.as_ref() == Some(&path) {
+                return true;
+            }
+            path.starts_with(&self.workspace)
+                && !path.components().any(|part| part.as_os_str() == ".git")
+                && !self.ignored.iter().any(|ignored| path.starts_with(ignored))
+        })
+    }
+}
+
+fn set_watches(
+    watcher: &mut impl Watcher,
+    old: &[(PathBuf, RecursiveMode)],
+    new: &[(PathBuf, RecursiveMode)],
+) -> Result<()> {
+    if old == new {
+        return Ok(());
+    }
+    // Re-register the complete set. Removing a nested watch after installing
+    // a new parent can otherwise remove backend watches shared by both roots.
+    // This happens before the next build, which reads edits made during the gap.
+    for (path, _) in old {
+        watcher
+            .unwatch(path)
+            .with_context(|| format!("stopping watch on {}", path.display()))?;
+    }
+    for (path, mode) in new {
+        watcher
+            .watch(path, *mode)
+            .with_context(|| format!("watching {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn wait_for_change(
+    receiver: &Receiver<WatchEvent>,
+    plan: &WatchPlan,
+    debounce: Duration,
+) -> Result<()> {
+    loop {
+        let event = receiver
+            .recv()
+            .context("filesystem watcher disconnected")?
+            .context("filesystem watcher failed")?;
+        if plan.relevant(&event) {
+            break;
+        }
+    }
+    let mut deadline = Instant::now() + debounce;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(event) => {
+                if plan.relevant(&event.context("filesystem watcher failed")?) {
+                    deadline = Instant::now() + debounce;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => return Ok(()),
+            Err(RecvTimeoutError::Disconnected) => anyhow::bail!("filesystem watcher disconnected"),
+        }
+    }
+}
+
+// Lexical normalization also works for removed files and directories that don't
+// exist yet, unlike canonicalize(). All watch roots and resolved paths are absolute.
+fn normalize(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{AccessKind, CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode};
+
+    fn plan() -> WatchPlan {
+        let root = std::env::temp_dir().join("watch-test-project");
+        WatchPlan {
+            workspace: root.clone(),
+            config: Some(root.join("Sycamore.toml")),
+            ignored: vec![
+                root.join("target"),
+                root.join("dist"),
+                root.join("custom-output"),
+            ],
+            roots: vec![(root, RecursiveMode::Recursive)],
+        }
+    }
+
+    fn event(kind: EventKind, path: PathBuf) -> Event {
+        Event::new(kind).add_path(path)
+    }
+
+    #[test]
+    fn accepts_source_manifest_lockfile_and_config_changes() {
+        let plan = plan();
+        for name in [
+            "src/main.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "Sycamore.toml",
+            "assets/style.css",
+        ] {
+            for kind in [
+                EventKind::Create(CreateKind::File),
+                EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                EventKind::Remove(RemoveKind::File),
+            ] {
+                assert!(
+                    plan.relevant(&event(kind, plan.workspace.join(name))),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn excludes_generated_files_git_and_read_events() {
+        let plan = plan();
+        for name in [
+            "target/debug/app.wasm",
+            "dist/app.js",
+            "custom-output/app_bg.wasm",
+            ".git/index",
+            "member/.git/HEAD",
+        ] {
+            assert!(
+                !plan.relevant(&event(
+                    EventKind::Create(CreateKind::File),
+                    plan.workspace.join(name)
+                )),
+                "{name}"
+            );
+        }
+        for kind in [
+            EventKind::Access(AccessKind::Any),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+        ] {
+            assert!(!plan.relevant(&event(kind, plan.workspace.join("src/main.rs"))));
+        }
+        assert!(plan.relevant(&event(
+            EventKind::Create(CreateKind::File),
+            plan.workspace.join("dist-source.rs")
+        )));
+    }
+
+    #[test]
+    fn handles_renames_and_external_configuration() {
+        let mut plan = plan();
+        let external = plan
+            .workspace
+            .parent()
+            .unwrap()
+            .join("external/Sycamore.toml");
+        plan.config = Some(external.clone());
+        assert!(plan.relevant(&event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            external.clone()
+        )));
+        assert!(!plan.relevant(&event(
+            EventKind::Create(CreateKind::File),
+            external.with_file_name("unrelated.txt")
+        )));
+        let renamed = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(plan.workspace.join("dist/temp"))
+            .add_path(plan.workspace.join("src/new.rs"));
+        assert!(plan.relevant(&renamed));
+    }
+
+    #[test]
+    fn coalesces_event_bursts_and_retains_changes_queued_during_a_build() {
+        let plan = plan();
+        let (sender, receiver) = mpsc::channel();
+        for _ in 0..5 {
+            sender
+                .send(Ok(event(
+                    EventKind::Create(CreateKind::File),
+                    plan.workspace.join("src/main.rs"),
+                )))
+                .unwrap();
+        }
+        wait_for_change(&receiver, &plan, Duration::from_millis(1)).unwrap();
+        assert!(receiver.try_recv().is_err());
+        // Simulate edits arriving while the synchronous build was running.
+        sender
+            .send(Ok(event(
+                EventKind::Remove(RemoveKind::File),
+                plan.workspace.join("src/old.rs"),
+            )))
+            .unwrap();
+        wait_for_change(&receiver, &plan, Duration::from_millis(1)).unwrap();
+    }
+
+    #[derive(Default)]
+    struct RecordingWatcher(Vec<(bool, PathBuf)>);
+
+    impl Watcher for RecordingWatcher {
+        fn new<F: notify::EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+            Ok(Self::default())
+        }
+        fn watch(&mut self, path: &Path, _: RecursiveMode) -> notify::Result<()> {
+            self.0.push((true, path.to_owned()));
+            Ok(())
+        }
+        fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+            self.0.push((false, path.to_owned()));
+            Ok(())
+        }
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
+    #[test]
+    fn replaces_overlapping_watch_roots_without_removing_new_watches() {
+        let plan = plan();
+        let parent = plan.workspace;
+        let child = parent.join("member");
+        let old = vec![
+            (child.clone(), RecursiveMode::Recursive),
+            (parent.clone(), RecursiveMode::NonRecursive),
+        ];
+        let new = vec![(parent.clone(), RecursiveMode::Recursive)];
+        let mut watcher = RecordingWatcher::default();
+        set_watches(&mut watcher, &old, &new).unwrap();
+        assert_eq!(
+            watcher.0,
+            vec![(false, child), (false, parent.clone()), (true, parent)]
+        );
+        watcher.0.clear();
+        set_watches(&mut watcher, &new, &new).unwrap();
+        assert!(watcher.0.is_empty());
+    }
+
+    #[test]
+    fn propagates_watcher_errors_and_disconnects() {
+        let plan = plan();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Err(notify::Error::generic("watch failed")))
+            .unwrap();
+        assert!(wait_for_change(&receiver, &plan, Duration::ZERO).is_err());
+        drop(sender);
+        assert!(wait_for_change(&receiver, &plan, Duration::ZERO).is_err());
+    }
+}

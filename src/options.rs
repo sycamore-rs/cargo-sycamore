@@ -57,6 +57,8 @@ pub struct BuildConfig {
 /// commands do not need to know which source supplied a value.
 #[derive(Debug)]
 pub struct Options {
+    /// Configuration file used during resolution, if any (for watch mode).
+    pub config_path: Option<PathBuf>,
     pub manifest_path: Option<PathBuf>,
     pub package: Option<String>,
     pub bin: Option<String>,
@@ -69,6 +71,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            config_path: None,
             manifest_path: None,
             package: None,
             bin: None,
@@ -128,6 +131,7 @@ impl Options {
             release: args.release,
             features: file.features,
             default_features: file.default_features.unwrap_or(true),
+            config_path,
         })
     }
 }

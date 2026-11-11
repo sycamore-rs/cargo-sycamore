@@ -17,6 +17,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Watch(args) => match cargo_sycamore::watch::watch(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error:#}");
+                ExitCode::FAILURE
+            }
+        },
         Command::New { path } => {
             eprintln!(
                 "error: creating a Sycamore application at '{}' is not yet implemented",

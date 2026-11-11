@@ -15,6 +15,8 @@ pub enum Command {
     /// Build a WASM application and generate web bindings.
     #[command(visible_alias = "b")]
     Build(cargo_sycamore::options::BuildArgs),
+    /// Watch the workspace and rebuild when files change.
+    Watch(cargo_sycamore::options::BuildArgs),
     /// Create a new Sycamore application (not yet implemented).
     New {
         /// Directory for the new application.
@@ -111,6 +113,30 @@ mod tests {
         assert!(
             matches!(cli.command, Command::Build(args) if args.config == Some(PathBuf::from("custom.toml")))
         );
+    }
+
+    #[test]
+    fn parses_watch_with_build_options() {
+        for args in [
+            vec![
+                "cargo-sycamore",
+                "watch",
+                "--release",
+                "--config",
+                "custom.toml",
+            ],
+            vec![
+                "cargo-sycamore",
+                "sycamore",
+                "watch",
+                "--release",
+                "--config",
+                "custom.toml",
+            ],
+        ] {
+            assert!(matches!(parse(&args).unwrap().command,
+                Command::Watch(options) if options.release && options.config == Some(PathBuf::from("custom.toml"))));
+        }
     }
 
     #[test]

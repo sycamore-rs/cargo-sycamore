@@ -59,6 +59,35 @@ bindings build, not an HTML/CSS bundler or development server. Existing files in
 the output directory are not cleaned. Set `GITHUB_TOKEN` if needed for GitHub API
 rate limits; it is passed to the downloader for API requests only.
 
+## Watching for changes
+
+```sh
+cargo sycamore watch
+cargo sycamore watch --release
+cargo sycamore watch --package my-app --out-dir public
+cargo sycamore watch --config path/to/Sycamore.toml
+```
+
+`watch` accepts the same flags and configuration as `build`. It builds immediately,
+then watches the entire Cargo workspace recursively. File creations, edits,
+deletions, and renames trigger a rebuild after a 250 ms quiet period. Builds run
+one at a time; edits during a build schedule a follow-up build rather than being
+lost. Compile errors are printed, and watching continues so fixing the source
+triggers another attempt. Stop with **Ctrl-C**.
+
+Cargo's target directory, each workspace package's default `dist/`, the configured
+output directory, and `.git` paths are ignored to avoid self-triggered rebuilds.
+Use a dedicated output directory, not the workspace root. Ignored paths are not
+available as watch inputs.
+
+The active `Sycamore.toml` is watched even when outside the workspace. Options are
+resolved again on each rebuild, so config changes take effect without restarting;
+invalid config is reported while watching continues. Watch roots and output
+exclusions are updated when valid configuration changes the project or output
+path. Local dependencies outside the workspace and other external assets are not
+watched. Native filesystem watcher errors are fatal rather than silently missing
+future edits.
+
 ## Configuration
 
 Create a `Sycamore.toml` in your project (a commented template is included here):
