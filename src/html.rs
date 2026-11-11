@@ -76,6 +76,33 @@ pub(crate) fn with_reload_client(template: &str, version: &str) -> Result<String
     append_script(template, &script, "script[data-cargo-sycamore-reload]")
 }
 
+/// SPA fallbacks keep root-relative asset resolution on nested browser routes.
+/// Honor an explicit user base URL; never write this change to disk.
+pub(crate) fn with_spa_base(template: &str) -> Result<String> {
+    let mut document = Html::parse_document(template);
+    let base_selector = Selector::parse("head base[href]").expect("valid base selector");
+    if document.select(&base_selector).next().is_none() {
+        let head_selector = Selector::parse("head").expect("valid head selector");
+        let head = document
+            .select(&head_selector)
+            .next()
+            .context("HTML document has no head")?
+            .id();
+        let fragment = Html::parse_fragment(r#"<base href="/">"#);
+        let fragment_selector = Selector::parse("base[href]").expect("valid base selector");
+        let base = fragment
+            .select(&fragment_selector)
+            .next()
+            .context("could not create SPA base element")?;
+        document
+            .tree
+            .get_mut(head)
+            .context("head missing from tree")?
+            .prepend(Node::Element(base.value().clone()));
+    }
+    Ok(document.html())
+}
+
 fn append_script(template: &str, script: &str, selector: &str) -> Result<String> {
     // html5ever supplies implicit head/body elements and handles casing,
     // comments, and omitted closing tags without string replacement.
@@ -162,6 +189,35 @@ mod tests {
         assert_eq!(
             first(&document, "script").value().attr("data-version"),
             Some("\"><script>alert(1)</script>")
+        );
+    }
+
+    #[test]
+    fn spa_base_is_prepended_and_respects_existing_base() {
+        let source = "<head><script type=module>import './app.js';</script></head><body>App</body>";
+        let html = with_spa_base(source).unwrap();
+        let document = Html::parse_document(&html);
+        assert_eq!(
+            first(&document, "head base").value().attr("href"),
+            Some("/")
+        );
+        assert_eq!(
+            first(&document, "head")
+                .child_elements()
+                .next()
+                .unwrap()
+                .value()
+                .name(),
+            "base"
+        );
+        let html = with_spa_base(&html).unwrap();
+        assert_eq!(count(&Html::parse_document(&html), "base[href]"), 1);
+        let html = with_spa_base("<head><base href='/custom/'></head>").unwrap();
+        let document = Html::parse_document(&html);
+        assert_eq!(count(&document, "base[href]"), 1);
+        assert_eq!(
+            first(&document, "base").value().attr("href"),
+            Some("/custom/")
         );
     }
 

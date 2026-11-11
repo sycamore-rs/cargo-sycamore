@@ -50,6 +50,7 @@ pub fn serve(args: ServeArgs) -> Result<()> {
         args,
         options.port,
         options.autoreload,
+        options.spa,
         directory,
     ))
 }
@@ -58,13 +59,16 @@ async fn serve_async(
     args: ServeArgs,
     port: u16,
     autoreload: bool,
+    spa: bool,
     directory: PathBuf,
 ) -> Result<()> {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
         .await
         .with_context(|| format!("binding development server on port {port}"))?;
     let address = listener.local_addr()?;
-    let state = Arc::new(ServerState::new(directory, address.port(), autoreload));
+    let mut state = ServerState::new(directory, address.port(), autoreload);
+    state.spa = spa;
+    let state = Arc::new(state);
     let app = router(Arc::clone(&state));
     eprintln!(
         "Serving {} at http://{address} (Ctrl-C to stop)",
@@ -123,6 +127,7 @@ struct ServerState {
     session: String,
     port: u16,
     autoreload: bool,
+    spa: bool,
 }
 
 impl ServerState {
@@ -145,6 +150,7 @@ impl ServerState {
             ),
             port,
             autoreload,
+            spa: false,
         }
     }
 
@@ -312,19 +318,41 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
         ),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let path = match resolve_file(&directory, request.uri().path()).await {
-        Ok(path) => path,
+    let (path, spa_fallback) = match resolve_file(&directory, request.uri().path()).await {
+        Ok(path) => (path, false),
+        Err(StatusCode::NOT_FOUND)
+            if state.spa && !request.uri().path().starts_with("/__sycamore/") =>
+        {
+            match resolve_file(&directory, "/index.html").await {
+                Ok(path) => (path, true),
+                Err(status) => return status.into_response(),
+            }
+        }
         Err(status) => return status.into_response(),
     };
-    if state.autoreload && mime_guess::from_path(&path).first_raw() == Some("text/html") {
+    if (state.autoreload || spa_fallback)
+        && mime_guess::from_path(&path).first_raw() == Some("text/html")
+    {
         let template = match tokio::fs::read_to_string(&path).await {
             Ok(template) => template,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        let html = match html::with_reload_client(&template, &version) {
+        let html = (|| -> Result<String> {
+            let template = if spa_fallback {
+                html::with_spa_base(&template)?
+            } else {
+                template
+            };
+            if state.autoreload {
+                html::with_reload_client(&template, &version)
+            } else {
+                Ok(template)
+            }
+        })();
+        let html = match html {
             Ok(html) => html,
             Err(error) => {
-                eprintln!("error: injecting reload client: {error:#}");
+                eprintln!("error: preparing served HTML: {error:#}");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
@@ -495,6 +523,83 @@ mod tests {
         assert_eq!(
             text(request(&app, Method::GET, "/").await).await,
             "new output"
+        );
+    }
+
+    #[tokio::test]
+    async fn spa_falls_back_to_index_without_hiding_real_files_or_unsafe_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = "<title>SPA</title><main>App shell</main>";
+        fs::write(temp.path().join("index.html"), source).unwrap();
+        fs::write(temp.path().join("app.js"), "export default 1;").unwrap();
+        fs::create_dir(temp.path().join("nested")).unwrap();
+        fs::write(
+            temp.path().join("nested/index.html"),
+            "<main>Real nested page</main>",
+        )
+        .unwrap();
+        for autoreload in [false, true] {
+            let mut state = ServerState::new(temp.path().to_owned(), 8080, autoreload);
+            state.spa = true;
+            let app = router(Arc::new(state));
+            let response = request(&app, Method::GET, "/users/profile?tab=1").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert!(
+                response.headers()[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/html")
+            );
+            let length = response.headers()[header::CONTENT_LENGTH].clone();
+            let html = text(response).await;
+            assert!(html.contains("App shell"));
+            assert!(html.contains("<base href=\"/\">"));
+            assert_eq!(html.contains("data-cargo-sycamore-reload"), autoreload);
+            let head = request(&app, Method::HEAD, "/users/profile").await;
+            assert_eq!(head.status(), StatusCode::OK);
+            assert_eq!(head.headers()[header::CONTENT_LENGTH], length);
+            assert!(text(head).await.is_empty());
+            assert_eq!(
+                text(request(&app, Method::GET, "/app.js").await).await,
+                "export default 1;"
+            );
+            assert!(
+                text(request(&app, Method::GET, "/nested/").await)
+                    .await
+                    .contains("Real nested page")
+            );
+            assert_eq!(
+                request(&app, Method::GET, "/missing.js").await.status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                request(&app, Method::GET, "/__sycamore/missing")
+                    .await
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                request(&app, Method::GET, "/%2e%2e/secret").await.status(),
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                request(&app, Method::POST, "/missing").await.status(),
+                StatusCode::METHOD_NOT_ALLOWED
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(temp.path().join("index.html")).unwrap(),
+            source
+        );
+        fs::remove_file(temp.path().join("index.html")).unwrap();
+        let mut state = ServerState::new(temp.path().to_owned(), 8080, false);
+        state.spa = true;
+        assert_eq!(
+            request(&router(Arc::new(state)), Method::GET, "/missing")
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
         );
     }
 

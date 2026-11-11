@@ -197,6 +197,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_spa_flag_and_explicit_overrides() {
+        for command in ["serve", "s"] {
+            for (flag, expected) in [
+                ("--spa", true),
+                ("--spa=true", true),
+                ("--spa=false", false),
+            ] {
+                assert!(
+                    matches!(parse(&["cargo-sycamore", command, flag, "--port", "9000"]).unwrap().command,
+                    Command::Serve(args) if args.spa == Some(expected) && args.port == Some(9000))
+                );
+            }
+            assert!(
+                matches!(parse(&["cargo-sycamore", command]).unwrap().command,
+                Command::Serve(args) if args.spa.is_none())
+            );
+        }
+        assert!(parse(&["cargo-sycamore", "serve", "--spa=invalid"]).is_err());
+        assert!(parse(&["cargo-sycamore", "build", "--spa"]).is_err());
+    }
+
+    #[test]
     fn accepts_serve_shorthand() {
         for args in [
             vec!["cargo-sycamore", "s", "--port", "9000"],

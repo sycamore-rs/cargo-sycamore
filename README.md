@@ -189,6 +189,7 @@ Configure the port in `Sycamore.toml`:
 [serve]
 port = 9000
 autoreload = true
+spa = false
 ```
 
 Autoreload defaults to `true`. Set `[serve].autoreload = false` to disable browser
@@ -197,6 +198,21 @@ reloads while continuing to watch and rebuild. Override either config value with
 Like the port, this setting takes effect when `serve` starts; restart after changing it.
 When disabled, HTML is served without a reload client and the reload endpoints are
 not registered.
+
+Set `[serve].spa = true` for single-page applications with client-side routing.
+Missing GET/HEAD paths fall back to the output directory's `index.html` with a 200
+HTML response. Existing files and directory indexes still take precedence; unsafe
+paths and reserved `/__sycamore/` endpoints do not fall back. If `index.html` is
+missing, the response remains 404. The fallback also applies to asset-like paths
+that are missing, not just extensionless routes.
+
+For nested routes, fallback HTML gets `<base href="/">` unless the template already
+has a `<base href>`; this keeps relative JS/WASM and asset URLs rooted correctly.
+Only the HTTP response is modified, never the source template or files on disk.
+SPA fallback works with or without autoreload and defaults to `false`. Use `--spa`
+(or `--spa=true`) to enable it, or `--spa=false` to override an enabled config
+setting. CLI values take precedence; an omitted flag preserves the config value.
+The setting takes effect at server startup (restart after changing it).
 
 `--port` overrides `[serve].port`; otherwise the default is 8080. The port is fixed
 at startup, so restart `serve` after changing it. Port 0 asks the OS for a free
@@ -227,8 +243,8 @@ All indicator UI lives in `src/reload.js` and is absent when autoreload is disab
 
 If your custom HTML has a Content Security Policy, allow the same-origin client
 script, local WebSocket connections, and the indicator's inline styles during
-development. There is no directory
-listing or SPA-route fallback. This is a **local development server**, not a
+development. There is no directory listing; SPA-route fallback is opt-in via
+`[serve].spa`. This is a **local development server**, not a
 production server; it deliberately listens only on loopback.
 
 ## Configuration
@@ -267,6 +283,7 @@ output directory and selects the release profile.
 Server settings live under `[serve]`: `port` corresponds to the serve-only
 `--port` flag and defaults to 8080. `autoreload` corresponds to `--autoreload` and
 defaults to `true`. Both CLI overrides preserve config values when omitted.
+`spa` corresponds to the serve-only `--spa` flag and defaults to `false`.
 
 Configuration is optional. Discovery starts in the directory containing the
 CLI-supplied `--manifest-path`, or the current directory when that flag is absent,

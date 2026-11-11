@@ -47,6 +47,9 @@ pub struct ServeArgs {
     /// Automatically reload browsers after successful builds (default: true).
     #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true, action = clap::ArgAction::Set)]
     pub autoreload: Option<bool>,
+    /// Serve index.html for missing pages (default: false; also configurable as [serve].spa).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true, action = clap::ArgAction::Set)]
+    pub spa: Option<bool>,
 }
 
 /// File input only. CLI-only settings intentionally cannot be deserialized.
@@ -62,6 +65,8 @@ pub struct Config {
 pub struct ServeConfig {
     pub port: Option<u16>,
     pub autoreload: Option<bool>,
+    /// Fallback to index.html for missing pages.
+    pub spa: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -94,6 +99,7 @@ pub struct Options {
     pub default_features: bool,
     pub port: u16,
     pub autoreload: bool,
+    pub spa: bool,
 }
 
 impl Default for Options {
@@ -110,6 +116,7 @@ impl Default for Options {
             default_features: true,
             port: 8080,
             autoreload: true,
+            spa: false,
         }
     }
 }
@@ -131,6 +138,9 @@ impl Options {
         }
         if let Some(autoreload) = args.autoreload {
             options.autoreload = autoreload;
+        }
+        if let Some(spa) = args.spa {
+            options.spa = spa;
         }
         Ok(options)
     }
@@ -192,6 +202,7 @@ impl Options {
             config_path,
             port: config.serve.port.unwrap_or(8080),
             autoreload: config.serve.autoreload.unwrap_or(true),
+            spa: config.serve.spa,
         })
     }
 }
@@ -235,6 +246,7 @@ mod tests {
             },
             port: None,
             autoreload: None,
+            spa: None,
         };
         assert_eq!(Options::resolve_serve(&args).unwrap().port, 8080);
         fs::write(&path, "[serve]\nport = 9000\n").unwrap();
@@ -308,6 +320,32 @@ mod tests {
         args.example = None;
         fs::write(&path, "[build]\nbin = 'client'\nexample = 'counter'\n").unwrap();
         assert!(Options::resolve(&args).is_err());
+    }
+
+    #[test]
+    fn spa_is_disabled_by_default_and_configurable_under_serve() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Sycamore.toml");
+        fs::write(&path, "").unwrap();
+        let args = ServeArgs {
+            build: BuildArgs {
+                config: Some(path.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!Options::resolve_serve(&args).unwrap().spa);
+        fs::write(&path, "[serve]\nspa = true\n").unwrap();
+        assert!(Options::resolve_serve(&args).unwrap().spa);
+        fs::write(&path, "[serve]\nspa = false\n").unwrap();
+        assert!(!Options::resolve_serve(&args).unwrap().spa);
+        let mut args = args;
+        args.spa = Some(true);
+        assert!(Options::resolve_serve(&args).unwrap().spa);
+        fs::write(&path, "[serve]\nspa = true\n").unwrap();
+        args.spa = Some(false);
+        assert!(!Options::resolve_serve(&args).unwrap().spa);
+        assert!(toml::from_str::<Config>("[serve]\nspa = 'true'").is_err());
     }
 
     #[test]

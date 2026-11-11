@@ -19,3 +19,5 @@ default-features = true
 port = 8080
 # Browser reload after successful builds; rebuilding remains enabled when false.
 autoreload = true
+# Serve index.html for missing routes; override with --spa or --spa=false.
+spa = false
