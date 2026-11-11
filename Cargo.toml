@@ -3,6 +3,9 @@ name = "cargo-sycamore"
 version = "0.1.0"
 edition = "2024"
 description = "Command-line tools for building Sycamore applications"
+license = "MIT"
+repository = "https://github.com/sycamore-rs/cargo-sycamore"
+homepage = "https://sycamore.dev"
 
 [dependencies]
 anyhow = "1"
@@ -14,14 +17,30 @@ fs2 = "0.4"
 notify = "8"
 scraper = { version = "0.29", default-features = false }
 percent-encoding = "2"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = [
+	"blocking",
+	"json",
+	"rustls",
+] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"
 tar = "0.4"
 tempfile = "3"
 toml = "1"
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "sync", "signal", "time"] }
+axum = { version = "0.8", default-features = false, features = [
+	"http1",
+	"tokio",
+	"ws",
+] }
+tokio = { version = "1", features = [
+	"rt-multi-thread",
+	"macros",
+	"net",
+	"fs",
+	"sync",
+	"signal",
+	"time",
+] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["fs"] }
 mime_guess = "2"
