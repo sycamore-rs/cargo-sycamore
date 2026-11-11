@@ -60,9 +60,16 @@ pub fn watch(args: &BuildArgs) -> Result<()> {
     watch_with(args, |_| Ok(()))
 }
 
+#[derive(Debug)]
+pub(crate) enum BuildEvent<'a> {
+    Started,
+    Succeeded(&'a Path),
+    Failed,
+}
+
 pub(crate) fn watch_with(
     args: &BuildArgs,
-    mut on_build: impl FnMut(&Path) -> Result<()>,
+    mut on_event: impl FnMut(BuildEvent<'_>) -> Result<()>,
 ) -> Result<()> {
     let options = Options::resolve(args)?;
     let mut plan = WatchPlan::new(&options)?;
@@ -74,7 +81,8 @@ pub(crate) fn watch_with(
     set_watches(&mut watcher, &[], &plan.roots)?;
     eprintln!("Watching {} (Ctrl-C to stop)", plan.workspace.display());
     // Install watches before building so edits during a build aren't lost.
-    report_build(&options, &mut on_build)?;
+    on_event(BuildEvent::Started)?;
+    report_build(&options, &mut on_event)?;
     loop {
         let changed = wait_for_change(&receiver, &plan, DEBOUNCE)?;
         if changed.is_empty() {
@@ -92,6 +100,7 @@ pub(crate) fn watch_with(
                 .join(", ");
             eprintln!("Changed: {paths}");
         }
+        on_event(BuildEvent::Started)?;
         // Reload file configuration on every rebuild, including changes to the
         // manifest/output paths. Keep the existing watches if resolution fails.
         let resolved = Options::resolve(args).and_then(|options| {
@@ -103,19 +112,25 @@ pub(crate) fn watch_with(
                 set_watches(&mut watcher, &plan.roots, &next.roots)?;
                 plan = next;
                 eprintln!("Change detected; rebuilding...");
-                report_build(&options, &mut on_build)?;
+                report_build(&options, &mut on_event)?;
             }
-            Err(error) => eprintln!("error: {error:#}\nWaiting for changes..."),
+            Err(error) => {
+                eprintln!("error: {error:#}\nWaiting for changes...");
+                on_event(BuildEvent::Failed)?;
+            }
         }
     }
 }
 
-fn report_build(options: &Options, on_build: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
+fn report_build(
+    options: &Options,
+    on_event: &mut impl FnMut(BuildEvent<'_>) -> Result<()>,
+) -> Result<()> {
     match build::build(options) {
-        Ok(directory) => on_build(&directory),
+        Ok(directory) => on_event(BuildEvent::Succeeded(&directory)),
         Err(error) => {
             eprintln!("error: {error:#}\nWaiting for changes...");
-            Ok(())
+            on_event(BuildEvent::Failed)
         }
     }
 }

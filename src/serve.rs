@@ -79,7 +79,17 @@ async fn serve_async(
     std::thread::Builder::new()
         .name("sycamore-watch".into())
         .spawn(move || {
-            let result = watch::watch_with(&args.build, |directory| state.built(directory));
+            let result = watch::watch_with(&args.build, |event| match event {
+                watch::BuildEvent::Started => {
+                    state.set_phase(BuildPhase::Building);
+                    Ok(())
+                }
+                watch::BuildEvent::Succeeded(directory) => state.built(directory),
+                watch::BuildEvent::Failed => {
+                    state.set_phase(BuildPhase::Failed);
+                    Ok(())
+                }
+            });
             let _ = sender.send(result);
         })
         .context("starting build watcher")?;
@@ -94,9 +104,22 @@ async fn serve_async(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildPhase {
+    Building,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BuildState {
+    revision: u64,
+    phase: BuildPhase,
+}
+
 struct ServerState {
     root: RwLock<PathBuf>,
-    revision: updates::Sender<u64>,
+    revision: updates::Sender<BuildState>,
     session: String,
     port: u16,
     autoreload: bool,
@@ -104,7 +127,10 @@ struct ServerState {
 
 impl ServerState {
     fn new(directory: PathBuf, port: u16, autoreload: bool) -> Self {
-        let (revision, _) = updates::channel(0);
+        let (revision, _) = updates::channel(BuildState {
+            revision: 0,
+            phase: BuildPhase::Building,
+        });
         Self {
             root: RwLock::new(directory),
             revision,
@@ -126,6 +152,24 @@ impl ServerState {
         format!("{}-{revision}", self.session)
     }
 
+    fn message(&self, state: BuildState) -> String {
+        match state.phase {
+            BuildPhase::Building => "building".into(),
+            BuildPhase::Failed => "error".into(),
+            BuildPhase::Ready => self.version(state.revision),
+        }
+    }
+
+    fn set_phase(&self, phase: BuildPhase) {
+        self.revision.send_if_modified(|state| {
+            if state.phase == phase {
+                return false;
+            }
+            state.phase = phase;
+            true
+        });
+    }
+
     fn built(&self, directory: &Path) -> Result<()> {
         let mut root = self
             .root
@@ -138,8 +182,10 @@ impl ServerState {
         // Called only after a successful build, including HTML generation.
         // Keep this under the root lock so HTTP snapshots see matching versions.
         // send_modify retains the latest revision even with no connected browsers.
-        self.revision
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        self.revision.send_modify(|state| {
+            state.revision = state.revision.wrapping_add(1);
+            state.phase = BuildPhase::Ready;
+        });
         Ok(())
     }
 }
@@ -225,18 +271,18 @@ async fn reload(
 async fn reload_socket(
     mut socket: WebSocket,
     state: Arc<ServerState>,
-    mut revisions: updates::Receiver<u64>,
+    mut revisions: updates::Receiver<BuildState>,
 ) {
-    let version = state.version(*revisions.borrow_and_update());
-    if socket.send(Message::Text(version.into())).await.is_err() {
+    let message = state.message(*revisions.borrow_and_update());
+    if socket.send(Message::Text(message.into())).await.is_err() {
         return;
     }
     loop {
         tokio::select! {
             changed = revisions.changed() => {
                 if changed.is_err() { break; }
-                let version = state.version(*revisions.borrow_and_update());
-                if socket.send(Message::Text(version.into())).await.is_err() { break; }
+                let message = state.message(*revisions.borrow_and_update());
+                if socket.send(Message::Text(message.into())).await.is_err() { break; }
             }
             message = socket.recv() => {
                 match message {
@@ -260,7 +306,10 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
     // Capture the revision before reading HTML. A build between this snapshot
     // and the WebSocket handshake is detected by the client's initial version.
     let (directory, version) = match state.root.read() {
-        Ok(root) => (root.clone(), state.version(*state.revision.borrow())),
+        Ok(root) => (
+            root.clone(),
+            state.version(state.revision.borrow().revision),
+        ),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let path = match resolve_file(&directory, request.uri().path()).await {
@@ -647,6 +696,40 @@ mod tests {
                 .await
                 .is_err()
         );
+        state.set_phase(BuildPhase::Building);
+        for socket in [&mut one, &mut two] {
+            let message = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(message.into_text().unwrap(), "building");
+        }
+        state.set_phase(BuildPhase::Failed);
+        for socket in [&mut one, &mut two] {
+            let message = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(message.into_text().unwrap(), "error");
+        }
+        assert_eq!(
+            state.revision.borrow().revision,
+            1,
+            "failed builds must not advance the reload version"
+        );
+        // A page connected after a failed build must also show the stale/error pill.
+        let (mut after_failure, _) = connect_async(websocket_request(address, Some(&origin)))
+            .await
+            .unwrap();
+        let message = timeout(Duration::from_secs(2), after_failure.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.into_text().unwrap(), "error");
+        after_failure.close(None).await.unwrap();
         let next_root = temp.path().join("next");
         fs::create_dir(&next_root).unwrap();
         fs::write(next_root.join("index.html"), "new output").unwrap();

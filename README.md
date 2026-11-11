@@ -215,10 +215,19 @@ paths `/__sycamore/reload.js` and `/__sycamore/reload` provide the client module
 and WebSocket endpoint. The client reconnects after disconnections and reloads
 when the server restarts or a successful build was missed while disconnected.
 Each served page carries its build version to catch rebuilds between loading the
-HTML and connecting the socket. All connected tabs are notified only after the
-complete successful build, including HTML generation, finishes. If your custom
-HTML has a Content Security Policy, allow the same-origin client script and local
-WebSocket connections. There is no directory
+HTML and connecting the socket. All connected tabs reload only after the complete
+successful build, including HTML generation, finishes.
+
+While rebuilding, a small bottom-of-page pill warns that the page may be stale.
+If compilation or configuration fails, it becomes a red error pill and points you
+to the terminal; failed builds never reload the page. New connections receive the
+current status too. The indicator uses isolated Shadow DOM styles, doesn't move
+page content or capture pointer events, and respects reduced-motion preferences.
+All indicator UI lives in `src/reload.js` and is absent when autoreload is disabled.
+
+If your custom HTML has a Content Security Policy, allow the same-origin client
+script, local WebSocket connections, and the indicator's inline styles during
+development. There is no directory
 listing or SPA-route fallback. This is a **local development server**, not a
 production server; it deliberately listens only on loopback.
 
