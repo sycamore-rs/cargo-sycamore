@@ -80,6 +80,19 @@ output directory, and `.git` paths are ignored to avoid self-triggered rebuilds.
 Use a dedicated output directory, not the workspace root. Ignored paths are not
 available as watch inputs.
 
+Common editor artifacts are excluded from rebuild triggers and change logs:
+
+- Vim: `4913`, `*~`, and hidden swap files (`.*.swp` through `.*.swa`, plus `.swp`).
+- Emacs: `*~`, `#*#` autosaves, and `.#*` lock files.
+- JetBrains: `*___jb_tmp___`, `*___jb_old___`, and `*___jb_bak___`.
+- Kate: `*.kate-swp`.
+- GIO/GNOME editors: `.goutputstream-*` atomic-save files.
+
+Atomic saves that rename a temporary file onto a real source file still trigger
+rebuilds and log the real destination. Ordinary dotfiles, `*.tmp`, and `*.bak`
+inputs are not broadly excluded. An explicitly loaded config file remains watched
+regardless of its filename.
+
 The active `Sycamore.toml` is watched even when outside the workspace. Options are
 resolved again on each rebuild, so config changes take effect without restarting;
 invalid config is reported while watching continues. Watch roots and output

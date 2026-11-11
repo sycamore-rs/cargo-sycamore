@@ -19,6 +19,36 @@ use crate::{
 const DEBOUNCE: Duration = Duration::from_millis(250);
 type WatchEvent = notify::Result<Event>;
 
+// Deliberately narrow editor-artifact patterns. Don't ignore all dotfiles or
+// generic *.tmp / *.bak files, which may be legitimate application inputs.
+const EDITOR_ARTIFACT_NAMES: &[&str] = &["4913"]; // Vim directory write check.
+const EDITOR_ARTIFACT_PREFIXES: &[&str] = &[
+    ".#",              // Emacs lock files: .#main.rs
+    ".goutputstream-", // GIO/GNOME editor atomic-save files.
+];
+const EDITOR_ARTIFACT_SUFFIXES: &[&str] = &[
+    "~",            // Vim/Emacs backups, numbered backups, Vim undo files.
+    "___jb_tmp___", // JetBrains safe-write temporary files.
+    "___jb_old___", // JetBrains safe-write originals.
+    "___jb_bak___", // JetBrains backups.
+    ".kate-swp",    // Kate swap files.
+];
+
+fn is_editor_artifact(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    EDITOR_ARTIFACT_NAMES.contains(&name)
+        || EDITOR_ARTIFACT_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        || EDITOR_ARTIFACT_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+        // Emacs autosaves: #main.rs#.
+        || (name.len() > 2 && name.starts_with('#') && name.ends_with('#'))
+        // Vim swap files: .main.rs.swp, .swo, ... .swa.
+        || (name.starts_with('.') && name.rsplit('.').next()
+            .is_some_and(|ext| ext.len() == 3 && ext.starts_with("sw")
+                && matches!(ext.as_bytes()[2], b'a'..=b'p')))
+}
+
 /// Build immediately, then rebuild on workspace/config changes until interrupted.
 /// Build/config errors are reported without stopping the watcher. Watcher errors
 /// are fatal, since otherwise we could silently miss future changes.
@@ -155,6 +185,7 @@ impl WatchPlan {
     fn relevant_path(&self, path: &Path) -> bool {
         self.config.as_deref() == Some(path)
             || (path.starts_with(&self.workspace)
+                && !is_editor_artifact(path)
                 && !path.components().any(|part| part.as_os_str() == ".git")
                 && !self.ignored.iter().any(|ignored| path.starts_with(ignored)))
     }
@@ -382,6 +413,73 @@ mod tests {
         }
         let changed = wait_for_change(&receiver, &plan, Duration::from_millis(1)).unwrap();
         assert_eq!(changed, BTreeSet::from([first, second]));
+    }
+
+    #[test]
+    fn filters_common_editor_artifacts_without_hiding_real_inputs() {
+        let plan = plan();
+        for name in [
+            "4913",
+            "main.rs~",
+            "main.rs.~1~",
+            ".main.rs.un~",
+            ".main.rs.swp",
+            ".main.rs.swo",
+            ".main.rs.swn",
+            ".main.rs.swa",
+            ".swp",
+            "#main.rs#",
+            ".#main.rs",
+            "main.rs___jb_tmp___",
+            "main.rs___jb_old___",
+            "main.rs___jb_bak___",
+            ".main.rs.kate-swp",
+            ".goutputstream-ABC123",
+        ] {
+            let path = plan.workspace.join("src").join(name);
+            assert!(is_editor_artifact(&path), "{name}");
+            assert!(
+                !plan.relevant(&event(EventKind::Create(CreateKind::File), path)),
+                "{name}"
+            );
+        }
+        for name in [
+            "main.rs",
+            ".env",
+            ".gitignore",
+            "input.tmp",
+            "fixture.bak",
+            "4913.rs",
+            "main.rs.swp",
+            "#heading.md",
+            "theme#",
+        ] {
+            assert!(!is_editor_artifact(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn atomic_editor_save_logs_only_the_destination_source_file() {
+        let plan = plan();
+        let source = plan.workspace.join("src/main.rs");
+        let (sender, receiver) = mpsc::channel();
+        for name in ["src/4913", "src/main.rs~", "src/.main.rs.swp"] {
+            sender
+                .send(Ok(event(
+                    EventKind::Create(CreateKind::File),
+                    plan.workspace.join(name),
+                )))
+                .unwrap();
+        }
+        sender
+            .send(Ok(Event::new(EventKind::Modify(ModifyKind::Name(
+                RenameMode::Both,
+            )))
+            .add_path(plan.workspace.join("src/main.rs___jb_tmp___"))
+            .add_path(source.clone())))
+            .unwrap();
+        let changed = wait_for_change(&receiver, &plan, Duration::from_millis(1)).unwrap();
+        assert_eq!(changed, BTreeSet::from([source]));
     }
 
     #[derive(Default)]
