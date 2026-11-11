@@ -52,8 +52,33 @@ pub fn generate(project_root: &Path, out_dir: &Path, output_name: &str) -> Resul
 }
 
 fn process(template: &str, output_name: &str) -> Result<String> {
-    // HTML5 parsing creates an implicit head/body for fragments and handles
-    // casing, comments, and omitted closing tags without string replacement.
+    let filename = format!("{output_name}.js");
+    let filename = utf8_percent_encode(&filename, ASSET_PATH);
+    let script = format!(
+        r#"<script type="module" data-cargo-sycamore>
+import init from "./{filename}";
+init().catch(error => console.error("Failed to initialize WASM:", error));
+</script>"#
+    );
+    append_script(template, &script, "script[data-cargo-sycamore]")
+}
+
+/// Inject only into HTTP responses; never add development code to build output.
+pub(crate) fn with_reload_client(template: &str, version: &str) -> Result<String> {
+    let version = version
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let script = format!(
+        r#"<script type="module" src="/__sycamore/reload.js" data-cargo-sycamore-reload data-version="{version}"></script>"#
+    );
+    append_script(template, &script, "script[data-cargo-sycamore-reload]")
+}
+
+fn append_script(template: &str, script: &str, selector: &str) -> Result<String> {
+    // html5ever supplies implicit head/body elements and handles casing,
+    // comments, and omitted closing tags without string replacement.
     let mut document = Html::parse_document(template);
     let head_selector = Selector::parse("head").expect("valid head selector");
     let head = document
@@ -61,9 +86,8 @@ fn process(template: &str, output_name: &str) -> Result<String> {
         .next()
         .context("HTML document has no head")?
         .id();
-    // Replace only our own generated script if the template contains one.
-    let generated_selector =
-        Selector::parse("script[data-cargo-sycamore]").expect("valid generated-script selector");
+    let generated_selector = Selector::parse(selector)
+        .map_err(|_| anyhow::anyhow!("invalid generated-script selector"))?;
     let previous: Vec<_> = document
         .select(&generated_selector)
         .map(|script| script.id())
@@ -75,19 +99,11 @@ fn process(template: &str, output_name: &str) -> Result<String> {
             .context("generated script missing from tree")?
             .detach();
     }
-    let filename = format!("{output_name}.js");
-    let filename = utf8_percent_encode(&filename, ASSET_PATH);
-    let script = format!(
-        r#"<script type="module" data-cargo-sycamore>
-import init from "./{filename}";
-init().catch(error => console.error("Failed to initialize WASM:", error));
-</script>"#
-    );
-    let fragment = Html::parse_fragment(&script);
+    let fragment = Html::parse_fragment(script);
     let script = fragment
         .select(&generated_selector)
         .next()
-        .context("could not create WASM startup script")?;
+        .context("could not create generated script")?;
     let mut head = document
         .tree
         .get_mut(head)
@@ -118,6 +134,35 @@ mod tests {
 
     fn text(element: ElementRef<'_>) -> String {
         element.text().collect()
+    }
+
+    #[test]
+    fn injects_reload_client_only_into_served_html_and_replaces_previous_client() {
+        let built = process(DEFAULT_HTML, "app").unwrap();
+        assert!(!built.contains("/__sycamore/reload"));
+        let served = with_reload_client(&built, "session-1").unwrap();
+        let served = with_reload_client(&served, "session-2").unwrap();
+        let document = Html::parse_document(&served);
+        assert_eq!(
+            count(&document, "head script[data-cargo-sycamore-reload]"),
+            1
+        );
+        let script = first(&document, "head script[data-cargo-sycamore-reload]");
+        assert_eq!(script.value().attr("src"), Some("/__sycamore/reload.js"));
+        assert_eq!(script.value().attr("data-version"), Some("session-2"));
+        assert_eq!(count(&document, "head script[data-cargo-sycamore]"), 1);
+        assert!(!built.contains("data-cargo-sycamore-reload"));
+    }
+
+    #[test]
+    fn reload_version_cannot_escape_its_attribute() {
+        let served = with_reload_client(DEFAULT_HTML, "\"><script>alert(1)</script>").unwrap();
+        let document = Html::parse_document(&served);
+        assert_eq!(count(&document, "script"), 1);
+        assert_eq!(
+            first(&document, "script").value().attr("data-version"),
+            Some("\"><script>alert(1)</script>")
+        );
     }
 
     #[test]

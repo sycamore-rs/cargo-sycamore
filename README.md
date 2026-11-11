@@ -145,8 +145,8 @@ cargo sycamore serve --release --package my-app --out-dir public
 same initial build and file watcher as `watch`, including automatic tool downloads,
 change logging, debounce, config reloads, and recovery from compilation errors.
 Requests return 404 until output exists; after a build failure, any existing output
-remains available. Refresh the browser to load rebuilt files—automatic browser
-reload is not implemented. Stop the server and watcher with **Ctrl-C**.
+remains available. Connected browsers automatically reload after successful builds;
+failed builds do not trigger a reload. Stop the server and watcher with **Ctrl-C**.
 
 Configure the port in `Sycamore.toml`:
 
@@ -160,9 +160,22 @@ at startup, so restart `serve` after changing it. Port 0 asks the OS for a free
 port, which is printed at startup. All regular build flags are supported too.
 Successful rebuilds update the served directory if build configuration changes it.
 
-The server supports GET/HEAD, directory `index.html`, and MIME types including
-`application/wasm`. Responses disable caching for development. Traversal and
-symlinks pointing outside the output directory are rejected. There is no directory
+The Axum server supports GET/HEAD, directory `index.html`, byte ranges for static
+assets, and MIME types including `application/wasm`. Responses disable caching for
+development. Traversal and symlinks pointing outside the output directory are rejected.
+Host headers are restricted to the local server, and WebSocket connections must
+have a matching same-origin browser Origin header.
+
+The reload client is injected into **served HTML responses only**—normal build
+output and source templates never contain development-server code. The reserved
+paths `/__sycamore/reload.js` and `/__sycamore/reload` provide the client module
+and WebSocket endpoint. The client reconnects after disconnections and reloads
+when the server restarts or a successful build was missed while disconnected.
+Each served page carries its build version to catch rebuilds between loading the
+HTML and connecting the socket. All connected tabs are notified only after the
+complete successful build, including HTML generation, finishes. If your custom
+HTML has a Content Security Policy, allow the same-origin client script and local
+WebSocket connections. There is no directory
 listing or SPA-route fallback. This is a **local development server**, not a
 production server; it deliberately listens only on loopback.
 
