@@ -11,13 +11,20 @@ fn main() -> ExitCode {
         Command::Build(args) => match cargo_sycamore::options::Options::resolve(&args)
             .and_then(|options| cargo_sycamore::build::build(&options))
         {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(_) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("error: {error:#}");
                 ExitCode::FAILURE
             }
         },
         Command::Watch(args) => match cargo_sycamore::watch::watch(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error:#}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Serve(args) => match cargo_sycamore::serve::serve(args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("error: {error:#}");

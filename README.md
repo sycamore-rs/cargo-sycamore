@@ -56,7 +56,7 @@ be unified, even if only one is used by the selected app.
 
 Only `wasm-bindgen-cli` is downloaded by `build` for now. The command generates
 an HTML entrypoint and WASM web bindings, but does not bundle/copy CSS or other
-static assets or run a development server. Existing files in the output directory
+static assets. Use `serve` for the development server. Existing files in the output directory
 are not cleaned. Set `GITHUB_TOKEN` if needed for GitHub API
 rate limits; it is passed to the downloader for API requests only.
 
@@ -131,6 +131,41 @@ path. Local dependencies outside the workspace and other external assets are not
 watched. Native filesystem watcher errors are fatal rather than silently missing
 future edits.
 
+## Development server
+
+```sh
+cargo sycamore serve
+cargo sycamore serve --port 9000
+cargo sycamore s --port 9000 # shorthand for serve
+cargo sycamore serve --release --package my-app --out-dir public
+```
+
+`serve` binds to **http://127.0.0.1:8080** by default and serves the selected app's
+`dist/` directory (or the output directory configured via CLI/TOML). It starts the
+same initial build and file watcher as `watch`, including automatic tool downloads,
+change logging, debounce, config reloads, and recovery from compilation errors.
+Requests return 404 until output exists; after a build failure, any existing output
+remains available. Refresh the browser to load rebuilt files—automatic browser
+reload is not implemented. Stop the server and watcher with **Ctrl-C**.
+
+Configure the port in `Sycamore.toml`:
+
+```toml
+[serve]
+port = 9000
+```
+
+`--port` overrides `[serve].port`; otherwise the default is 8080. The port is fixed
+at startup, so restart `serve` after changing it. Port 0 asks the OS for a free
+port, which is printed at startup. All regular build flags are supported too.
+Successful rebuilds update the served directory if build configuration changes it.
+
+The server supports GET/HEAD, directory `index.html`, and MIME types including
+`application/wasm`. Responses disable caching for development. Traversal and
+symlinks pointing outside the output directory are rejected. There is no directory
+listing or SPA-route fallback. This is a **local development server**, not a
+production server; it deliberately listens only on loopback.
+
 ## Configuration
 
 Create a `Sycamore.toml` in your project (a commented template is included here):
@@ -163,6 +198,9 @@ output directory and selects the release profile.
 | Release profile | `--release` | — | debug |
 | Config file | `--config` | — | nearest `Sycamore.toml` |
 
+Server settings live under `[serve]`: `port` corresponds to the serve-only
+`--port` flag and defaults to 8080.
+
 Configuration is optional. Discovery starts in the directory containing the
 CLI-supplied `--manifest-path`, or the current directory when that flag is absent,
 then searches ancestors for the nearest `Sycamore.toml`. Only that file is loaded;
@@ -181,9 +219,9 @@ are errors. Set `default-features = false` to pass `--no-default-features` to Ca
 
 `src/options.rs` keeps three separate types:
 
-- `BuildArgs`: clap CLI input, preserving absent flags as `Option` values.
-- `Config` / `BuildConfig`: the supported TOML schema, without CLI-only fields.
-- `Options`: the final merged values consumed by the build command, independent
+- `BuildArgs` / `ServeArgs`: clap CLI input, preserving absent flags as `Option` values.
+- `Config` / `BuildConfig` / `ServeConfig`: the supported TOML schema, without CLI-only fields.
+- `Options`: the final merged values consumed by commands, independent
   of where each value came from.
 
 ## Other commands

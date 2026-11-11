@@ -12,3 +12,7 @@ features = []
 default-features = true
 
 # `release` is deliberately CLI-only: use `cargo sycamore build --release`.
+
+[serve]
+# May be overridden with `cargo sycamore serve --port 9000`.
+port = 8080

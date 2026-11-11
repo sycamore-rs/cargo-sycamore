@@ -18,6 +18,9 @@ pub enum Command {
     /// Watch the workspace and rebuild when files change.
     #[command(visible_alias = "w")]
     Watch(cargo_sycamore::options::BuildArgs),
+    /// Serve the app locally, watching and rebuilding on changes.
+    #[command(visible_alias = "s")]
+    Serve(cargo_sycamore::options::ServeArgs),
     /// Create a new Sycamore application (not yet implemented).
     New {
         /// Directory for the new application.
@@ -114,6 +117,41 @@ mod tests {
         assert!(
             matches!(cli.command, Command::Build(args) if args.config == Some(PathBuf::from("custom.toml")))
         );
+    }
+
+    #[test]
+    fn parses_serve_with_port_and_build_options() {
+        for args in [
+            vec!["cargo-sycamore", "serve", "--port", "9000", "--release"],
+            vec![
+                "cargo-sycamore",
+                "sycamore",
+                "serve",
+                "--port",
+                "9000",
+                "--release",
+            ],
+        ] {
+            assert!(matches!(parse(&args).unwrap().command,
+                Command::Serve(options) if options.port == Some(9000) && options.build.release));
+        }
+        assert!(
+            matches!(parse(&["cargo-sycamore", "serve"]).unwrap().command,
+            Command::Serve(options) if options.port.is_none())
+        );
+        assert!(parse(&["cargo-sycamore", "serve", "--port", "65536"]).is_err());
+        assert!(parse(&["cargo-sycamore", "build", "--port", "8080"]).is_err());
+    }
+
+    #[test]
+    fn accepts_serve_shorthand() {
+        for args in [
+            vec!["cargo-sycamore", "s", "--port", "9000"],
+            vec!["cargo-sycamore", "sycamore", "s", "--port", "9000"],
+        ] {
+            assert!(matches!(parse(&args).unwrap().command,
+                Command::Serve(options) if options.port == Some(9000)));
+        }
     }
 
     #[test]

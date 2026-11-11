@@ -20,7 +20,8 @@ use crate::{
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
-pub fn build(options: &Options) -> Result<()> {
+/// Build the application, returning the output directory actually used.
+pub fn build(options: &Options) -> Result<PathBuf> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     build_with(options, &cargo, |version| {
         eprintln!("Ensuring wasm-bindgen-cli {version} is available...");
@@ -36,7 +37,7 @@ fn build_with(
     options: &Options,
     cargo: &OsStr,
     ensure_bindgen: impl FnOnce(&str) -> Result<PathBuf>,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let mut metadata_command = MetadataCommand::new();
     metadata_command.cargo_path(cargo).no_deps();
     if let Some(manifest) = &options.manifest_path {
@@ -124,14 +125,7 @@ fn build_with(
     let lockfile = metadata.workspace_root.join("Cargo.lock");
     let version = wasm_bindgen_version(lockfile.as_std_path())?;
     let bindgen = ensure_bindgen(&version)?;
-    let out_dir = options.out_dir.clone().unwrap_or_else(|| {
-        package
-            .manifest_path
-            .parent()
-            .expect("manifest has a parent")
-            .join("dist")
-            .into_std_path_buf()
-    });
+    let out_dir = package_output_directory(options, package);
     fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     let output_name = wasm
         .file_stem()
@@ -155,7 +149,33 @@ fn build_with(
         .context("manifest has no parent")?;
     crate::html::generate(project_root.as_std_path(), &out_dir, output_name)?;
     eprintln!("Built {} → {}", package.name, out_dir.display());
-    Ok(())
+    Ok(out_dir)
+}
+
+/// Resolve the same output directory as build, without compiling anything.
+pub(crate) fn output_directory(options: &Options) -> Result<PathBuf> {
+    let mut command = MetadataCommand::new();
+    command.no_deps();
+    if let Some(cargo) = std::env::var_os("CARGO") {
+        command.cargo_path(cargo);
+    }
+    if let Some(manifest) = &options.manifest_path {
+        command.manifest_path(manifest);
+    }
+    let metadata = command.exec().context("reading Cargo project metadata")?;
+    let package = select_package(&metadata, options.package.as_deref())?;
+    Ok(package_output_directory(options, package))
+}
+
+fn package_output_directory(options: &Options, package: &Package) -> PathBuf {
+    options.out_dir.clone().unwrap_or_else(|| {
+        package
+            .manifest_path
+            .parent()
+            .expect("manifest has a parent")
+            .join("dist")
+            .into_std_path_buf()
+    })
 }
 
 fn select_package<'a>(metadata: &'a Metadata, name: Option<&str>) -> Result<&'a Package> {

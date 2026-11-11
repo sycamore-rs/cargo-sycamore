@@ -33,11 +33,28 @@ pub struct BuildArgs {
     pub config: Option<PathBuf>,
 }
 
+/// Serve-specific flags, alongside all standard build/watch flags.
+#[derive(Debug, Default, Args)]
+pub struct ServeArgs {
+    #[command(flatten)]
+    pub build: BuildArgs,
+    /// Local HTTP port (also configurable as [serve].port).
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
+}
+
 /// File input only. CLI-only settings intentionally cannot be deserialized.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub build: BuildConfig,
+    pub serve: ServeConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServeConfig {
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -66,6 +83,7 @@ pub struct Options {
     pub release: bool,
     pub features: Vec<String>,
     pub default_features: bool,
+    pub port: u16,
 }
 
 impl Default for Options {
@@ -79,6 +97,7 @@ impl Default for Options {
             release: false,
             features: Vec::new(),
             default_features: true,
+            port: 8080,
         }
     }
 }
@@ -91,6 +110,14 @@ impl Options {
             args,
             &std::env::current_dir().context("reading current directory")?,
         )
+    }
+
+    pub fn resolve_serve(args: &ServeArgs) -> Result<Self> {
+        let mut options = Self::resolve(&args.build)?;
+        if let Some(port) = args.port {
+            options.port = port;
+        }
+        Ok(options)
     }
 
     fn resolve_in(args: &BuildArgs, cwd: &Path) -> Result<Self> {
@@ -132,6 +159,7 @@ impl Options {
             features: file.features,
             default_features: file.default_features.unwrap_or(true),
             config_path,
+            port: config.serve.port.unwrap_or(8080),
         })
     }
 }
@@ -162,6 +190,33 @@ fn discover(start: &Path) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_port_defaults_config_and_cli_precedence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Sycamore.toml");
+        fs::write(&path, "").unwrap();
+        let mut args = ServeArgs {
+            build: BuildArgs {
+                config: Some(path.clone()),
+                ..Default::default()
+            },
+            port: None,
+        };
+        assert_eq!(Options::resolve_serve(&args).unwrap().port, 8080);
+        fs::write(&path, "[serve]\nport = 9000\n").unwrap();
+        assert_eq!(Options::resolve_serve(&args).unwrap().port, 9000);
+        args.port = Some(9090);
+        assert_eq!(Options::resolve_serve(&args).unwrap().port, 9090);
+        for config in [
+            "[serve]\nport = 65536",
+            "[serve]\nport = -1",
+            "[serve]\nport = 'bad'",
+            "[serve]\nunknown = true",
+        ] {
+            assert!(toml::from_str::<Config>(config).is_err());
+        }
+    }
 
     #[test]
     fn defaults_work_without_a_config_file() {

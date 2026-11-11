@@ -52,7 +52,18 @@ fn is_editor_artifact(path: &Path) -> bool {
 /// Build immediately, then rebuild on workspace/config changes until interrupted.
 /// Build/config errors are reported without stopping the watcher. Watcher errors
 /// are fatal, since otherwise we could silently miss future changes.
+pub(crate) fn validate(options: &Options) -> Result<()> {
+    WatchPlan::new(options).map(|_| ())
+}
+
 pub fn watch(args: &BuildArgs) -> Result<()> {
+    watch_with(args, |_| Ok(()))
+}
+
+pub(crate) fn watch_with(
+    args: &BuildArgs,
+    mut on_build: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
     let options = Options::resolve(args)?;
     let mut plan = WatchPlan::new(&options)?;
     let (sender, receiver) = mpsc::channel();
@@ -63,7 +74,7 @@ pub fn watch(args: &BuildArgs) -> Result<()> {
     set_watches(&mut watcher, &[], &plan.roots)?;
     eprintln!("Watching {} (Ctrl-C to stop)", plan.workspace.display());
     // Install watches before building so edits during a build aren't lost.
-    report_build(&options);
+    report_build(&options, &mut on_build)?;
     loop {
         let changed = wait_for_change(&receiver, &plan, DEBOUNCE)?;
         if changed.is_empty() {
@@ -92,16 +103,20 @@ pub fn watch(args: &BuildArgs) -> Result<()> {
                 set_watches(&mut watcher, &plan.roots, &next.roots)?;
                 plan = next;
                 eprintln!("Change detected; rebuilding...");
-                report_build(&options);
+                report_build(&options, &mut on_build)?;
             }
             Err(error) => eprintln!("error: {error:#}\nWaiting for changes..."),
         }
     }
 }
 
-fn report_build(options: &Options) {
-    if let Err(error) = build::build(options) {
-        eprintln!("error: {error:#}\nWaiting for changes...");
+fn report_build(options: &Options, on_build: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
+    match build::build(options) {
+        Ok(directory) => on_build(&directory),
+        Err(error) => {
+            eprintln!("error: {error:#}\nWaiting for changes...");
+            Ok(())
+        }
     }
 }
 
