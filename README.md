@@ -44,8 +44,8 @@ The build command:
 4. Automatically downloads/caches that version of `wasm-bindgen-cli` and runs
    it with `--target web` on the actual WASM artifact reported by Cargo.
 
-Generated JavaScript, WASM, and TypeScript declarations go into the package's
-`dist/` directory by default. An explicit `--out-dir` is relative to the current
+Generated JavaScript and WASM go into the package's `dist/` directory by default.
+TypeScript declarations are disabled with wasm-bindgen's `--no-typescript` flag. An explicit `--out-dir` is relative to the current
 working directory. Custom Cargo target directories are supported.
 
 The app must depend (directly or transitively) on a released registry version of

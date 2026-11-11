@@ -137,6 +137,7 @@ fn build_with(
         .arg(&wasm)
         .arg("--target")
         .arg("web")
+        .arg("--no-typescript")
         .arg("--out-dir")
         .arg(&out_dir)
         .status()
@@ -474,7 +475,7 @@ mod tests {
             assert!(args.contains("--no-default-features\n"));
             let args = fs::read_to_string(root.join("bindgen-args")).unwrap();
             assert!(args.contains("custom-target/test_app.wasm\n"));
-            assert!(args.contains("--target\nweb\n--out-dir\n"));
+            assert!(args.contains("--target\nweb\n--no-typescript\n--out-dir\n"));
             assert!(root.join("dist").is_dir());
         }
 
