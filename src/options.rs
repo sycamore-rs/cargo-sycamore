@@ -123,6 +123,7 @@ impl Default for Options {
 
 impl Options {
     /// Resolve flags over the nearest configuration, then apply defaults.
+    /// An explicit --package starts discovery at that workspace package's root.
     /// CLI paths are relative to cwd; config paths are relative to the config file.
     pub fn resolve(args: &BuildArgs) -> Result<Self> {
         Self::resolve_in(
@@ -149,8 +150,16 @@ impl Options {
         let config_path = match &args.config {
             Some(path) => Some(absolute(cwd, path)),
             None => {
-                let start = args.manifest_path.as_ref().map(|path| absolute(cwd, path));
-                discover(start.as_deref().and_then(Path::parent).unwrap_or(cwd))?
+                let start = if let Some(package) = &args.package {
+                    package_directory(args, cwd, package)?
+                } else {
+                    args.manifest_path
+                        .as_ref()
+                        .map(|path| absolute(cwd, path))
+                        .and_then(|path| path.parent().map(Path::to_path_buf))
+                        .unwrap_or_else(|| cwd.to_owned())
+                };
+                discover(&start)?
             }
         };
         let (config, base) = if let Some(path) = &config_path {
@@ -213,6 +222,33 @@ fn absolute(base: &Path, path: &Path) -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+/// Discovery must use CLI inputs only: the configuration has not been selected
+/// yet. In particular, a configured package must not recursively select a file.
+fn package_directory(args: &BuildArgs, cwd: &Path, name: &str) -> Result<PathBuf> {
+    let mut command = cargo_metadata::MetadataCommand::new();
+    command.no_deps().current_dir(cwd);
+    if let Some(cargo) = std::env::var_os("CARGO") {
+        command.cargo_path(cargo);
+    }
+    if let Some(manifest) = &args.manifest_path {
+        command.manifest_path(absolute(cwd, manifest));
+    }
+    let metadata = command
+        .exec()
+        .context("reading Cargo metadata for package configuration discovery")?;
+    let package = metadata
+        .workspace_packages()
+        .into_iter()
+        .find(|package| package.name == name)
+        .with_context(|| format!("workspace has no package named '{name}'"))?;
+    Ok(package
+        .manifest_path
+        .parent()
+        .context("package manifest has no parent directory")?
+        .to_path_buf()
+        .into_std_path_buf())
 }
 
 fn discover(start: &Path) -> Result<Option<PathBuf>> {
@@ -436,6 +472,117 @@ mod tests {
         fs::remove_file(member.join("Sycamore.toml")).unwrap();
         let options = Options::resolve_in(&args, temp.path()).unwrap();
         assert_eq!(options.package.as_deref(), Some("root"));
+    }
+
+    fn package_workspace(root: &Path) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = ['apps/frontend', 'apps/other']\nresolver = '3'\n",
+        )
+        .unwrap();
+        for name in ["frontend", "other"] {
+            let package = root.join("apps").join(name);
+            fs::create_dir_all(package.join("src")).unwrap();
+            fs::write(
+                package.join("Cargo.toml"),
+                format!("[package]\nname = '{name}'\nversion = '0.1.0'\nedition = '2024'\n"),
+            )
+            .unwrap();
+            fs::write(package.join("src/lib.rs"), "").unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_package_prefers_its_config_without_merging_ancestors() {
+        let temp = tempfile::tempdir().unwrap();
+        package_workspace(temp.path());
+        let member = temp.path().join("apps/frontend");
+        fs::write(temp.path().join("Sycamore.toml"), "[build]\npackage = 'other'\nfeatures = ['root']\ndefault-features = false\n[serve]\nspa = true\nport = 9090\n").unwrap();
+        fs::write(
+            member.join("Sycamore.toml"),
+            "[build]\nout-dir = 'local-dist'\n",
+        )
+        .unwrap();
+        let args = BuildArgs {
+            package: Some("frontend".into()),
+            ..Default::default()
+        };
+        for cwd in [temp.path().to_owned(), temp.path().join("apps/other/src")] {
+            let options = Options::resolve_in(&args, &cwd).unwrap();
+            assert_eq!(options.config_path, Some(member.join("Sycamore.toml")));
+            assert_eq!(options.out_dir, Some(member.join("local-dist")));
+            assert_eq!(options.package.as_deref(), Some("frontend"));
+            assert!(options.features.is_empty());
+            assert!(options.default_features);
+            assert!(!options.spa);
+            assert_eq!(options.port, 8080);
+        }
+        let args = BuildArgs {
+            out_dir: Some("cli-dist".into()),
+            ..args
+        };
+        assert_eq!(
+            Options::resolve_in(&args, temp.path()).unwrap().out_dir,
+            Some(temp.path().join("cli-dist"))
+        );
+        fs::remove_file(member.join("Sycamore.toml")).unwrap();
+        let options = Options::resolve_in(&args, temp.path()).unwrap();
+        assert_eq!(options.config_path, Some(temp.path().join("Sycamore.toml")));
+        assert_eq!(options.package.as_deref(), Some("frontend"));
+        assert_eq!(options.features, ["root"]);
+        assert!(options.spa);
+    }
+
+    #[test]
+    fn package_discovery_uses_cli_manifest_from_outside_the_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let cwd = temp.path().join("outside");
+        fs::create_dir(&cwd).unwrap();
+        package_workspace(&root);
+        let member = root.join("apps/frontend");
+        fs::write(member.join("Sycamore.toml"), "[serve]\nspa = true\n").unwrap();
+        let args = BuildArgs {
+            manifest_path: Some("../workspace/Cargo.toml".into()),
+            package: Some("frontend".into()),
+            ..Default::default()
+        };
+        let options = Options::resolve_in(&args, &cwd).unwrap();
+        assert_eq!(options.config_path, Some(member.join("Sycamore.toml")));
+        assert!(options.spa);
+        assert_eq!(
+            options.manifest_path,
+            Some(cwd.join("../workspace/Cargo.toml"))
+        );
+    }
+
+    #[test]
+    fn package_discovery_reports_errors_but_explicit_config_bypasses_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        package_workspace(temp.path());
+        let member = temp.path().join("apps/frontend");
+        fs::write(temp.path().join("Sycamore.toml"), "[serve]\nspa = true\n").unwrap();
+        fs::write(member.join("Sycamore.toml"), "invalid [toml").unwrap();
+        let mut args = BuildArgs {
+            package: Some("frontend".into()),
+            ..Default::default()
+        };
+        assert!(
+            format!("{:#}", Options::resolve_in(&args, temp.path()).unwrap_err())
+                .contains("parsing configuration")
+        );
+        args.package = Some("missing".into());
+        assert!(
+            format!("{:#}", Options::resolve_in(&args, temp.path()).unwrap_err())
+                .contains("workspace has no package named 'missing'")
+        );
+        args.manifest_path = Some("missing/Cargo.toml".into());
+        assert!(Options::resolve_in(&args, temp.path()).is_err());
+        args.config = Some("Sycamore.toml".into());
+        let options = Options::resolve_in(&args, temp.path()).unwrap();
+        assert!(options.spa);
+        assert_eq!(options.package.as_deref(), Some("missing"));
     }
 
     #[test]

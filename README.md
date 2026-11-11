@@ -285,11 +285,22 @@ Server settings live under `[serve]`: `port` corresponds to the serve-only
 defaults to `true`. Both CLI overrides preserve config values when omitted.
 `spa` corresponds to the serve-only `--spa` flag and defaults to `false`.
 
-Configuration is optional. Discovery starts in the directory containing the
-CLI-supplied `--manifest-path`, or the current directory when that flag is absent,
-then searches ancestors for the nearest `Sycamore.toml`. Only that file is loaded;
-parent and child files are not layered. Use `--config path/to/Sycamore.toml` to
-select a file explicitly (a missing explicit file is an error).
+Configuration is optional. An explicit `--config path/to/Sycamore.toml` selects
+that file and bypasses automatic discovery (a missing explicit file is an error).
+Otherwise:
+
+- With CLI `--package <NAME>`, Cargo metadata locates that workspace package and
+  discovery starts at its root. A package-local `Sycamore.toml` is preferred;
+  without one, ancestor configs (such as the workspace's) are considered.
+- Without `--package`, discovery starts in the directory containing the
+  CLI-supplied `--manifest-path`, or the current directory when it is absent.
+
+Discovery searches upward for the nearest `Sycamore.toml`. Only that file is
+loaded; parent and child files are not layered, and CLI options still override
+its values. Package discovery uses the CLI manifest path or current Cargo project;
+a package set inside a config does not trigger another round of discovery.
+Unknown packages and malformed selected configs are errors, not reasons to fall
+back to another config.
 
 CLI paths, including `--config`, are relative to your current working directory.
 Paths written **inside** the config are relative to the directory containing that
