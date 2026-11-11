@@ -12,6 +12,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Build a WASM application and generate web bindings.
+    #[command(visible_alias = "b")]
+    Build(cargo_sycamore::build::BuildOptions),
     /// Create a new Sycamore application (not yet implemented).
     New {
         /// Directory for the new application.
@@ -60,6 +63,50 @@ mod tests {
             assert!(
                 matches!(cli.command, Command::New { path } if path == std::path::Path::new("my-app"))
             );
+        }
+    }
+
+    #[test]
+    fn parses_build_options() {
+        let cli = parse(&[
+            "cargo-sycamore",
+            "sycamore",
+            "build",
+            "--release",
+            "--package",
+            "app",
+            "--bin",
+            "client",
+            "--manifest-path",
+            "app/Cargo.toml",
+            "--out-dir",
+            "public",
+        ])
+        .unwrap();
+        let Command::Build(options) = cli.command else {
+            panic!("expected build");
+        };
+        assert!(options.release);
+        assert_eq!(options.package.as_deref(), Some("app"));
+        assert_eq!(options.bin.as_deref(), Some("client"));
+        assert_eq!(options.out_dir, Some(PathBuf::from("public")));
+        assert_eq!(options.manifest_path, Some(PathBuf::from("app/Cargo.toml")));
+        assert!(matches!(
+            parse(&["cargo-sycamore", "build"]).unwrap().command,
+            Command::Build(_)
+        ));
+    }
+
+    #[test]
+    fn accepts_build_shorthand() {
+        for args in [
+            vec!["cargo-sycamore", "b", "--release"],
+            vec!["cargo-sycamore", "sycamore", "b", "--release"],
+        ] {
+            assert!(matches!(
+                parse(&args).unwrap().command,
+                Command::Build(options) if options.release
+            ));
         }
     }
 

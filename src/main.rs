@@ -8,6 +8,13 @@ fn main() -> ExitCode {
     let cli = Cli::parse_args();
 
     match cli.command {
+        Command::Build(options) => match cargo_sycamore::build::build(&options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error:#}");
+                ExitCode::FAILURE
+            }
+        },
         Command::New { path } => {
             eprintln!(
                 "error: creating a Sycamore application at '{}' is not yet implemented",
