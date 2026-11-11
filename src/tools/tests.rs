@@ -134,11 +134,22 @@ fn failures_do_not_publish_cache_and_can_be_retried() {
 }
 
 #[test]
+fn sha256_encoding_matches_standard_test_vector() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("asset");
+    fs::write(&path, b"abc").unwrap();
+    let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    assert_eq!(hex_digest(Sha256::digest(b"abc")), expected);
+    verify_sha256(&path, expected).unwrap();
+    verify_sha256(&path, &expected.to_ascii_uppercase()).unwrap();
+}
+
+#[test]
 fn checksums_are_verified_before_publication() {
     let temp = tempfile::tempdir().unwrap();
     let cache = ToolCache::new(temp.path()).unwrap();
     let mut spec = release(ArchiveFormat::Binary);
-    spec.sha256 = Some(format!("{:x}", Sha256::digest(b"expected")));
+    spec.sha256 = Some(hex_digest(Sha256::digest(b"expected")));
     assert!(
         cache
             .install(&spec, |path| Ok(fs::write(path, b"tampered")?))

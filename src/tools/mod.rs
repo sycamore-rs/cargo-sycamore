@@ -136,7 +136,7 @@ impl ToolCache {
         release.validate()?;
         // Include the entire definition, so different repositories, target assets,
         // extraction layouts, and trusted checksums cannot share an installation.
-        let key = format!("{:x}", Sha256::digest(format!("{release:?}")));
+        let key = hex_digest(Sha256::digest(format!("{release:?}")));
         fs::create_dir_all(&self.root)?;
         let lock = OpenOptions::new()
             .create(true)
@@ -321,12 +321,37 @@ fn validate_digest(digest: &str) -> Result<()> {
     Ok(())
 }
 
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .as_ref()
+        .iter()
+        .flat_map(|&byte| {
+            [
+                char::from(HEX[usize::from(byte >> 4)]),
+                char::from(HEX[usize::from(byte & 0x0f)]),
+            ]
+        })
+        .collect()
+}
+
 fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     validate_digest(expected)?;
     let mut hash = Sha256::new();
-    io::copy(&mut File::open(path)?, &mut hash)?;
+    let mut file = File::open(path)?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = match file.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
     ensure!(
-        format!("{:x}", hash.finalize()).eq_ignore_ascii_case(expected),
+        hex_digest(hash.finalize()).eq_ignore_ascii_case(expected),
         "SHA-256 checksum mismatch"
     );
     Ok(())
