@@ -99,11 +99,11 @@ browser reload. Optimization may increase release rebuild times.
 
 ### Tailwind CSS
 
-Enable the standalone Tailwind CSS compiler by setting any option under
-`[tools.tailwindcss]` in `Sycamore.toml`:
+Enable the standalone Tailwind CSS compiler explicitly in `Sycamore.toml`:
 
 ```toml
 [tools.tailwindcss]
+enable = true
 input = "styles/input.css"
 # Optional: defaults to index.css inside the resolved build output directory.
 output = "dist/index.css"
@@ -115,11 +115,15 @@ The same settings work in Cargo metadata:
 
 ```toml
 [package.metadata.sycamore.tools.tailwindcss]
+enable = true
 input = "styles/input.css"
 ```
 
-- Setting **any** of `input`, `output`, or `version` enables Tailwind. An omitted
-  or empty table leaves it disabled; there are no additional CLI flags.
+- `enable = true` is required to run Tailwind. It defaults to `false`; setting
+  `input`, `output`, or `version` alone does not activate it. A warning is printed
+  if these options are set while `enable` is false or omitted. There are no
+  additional CLI flags. Disabling Tailwind also removes the generated stylesheet
+  link from subsequent HTML output.
 - The default input is `index.css` beside the selected config file or manifest.
   Create the input file; for Tailwind v4, start with `@import "tailwindcss";`.
 - Explicit input/output paths are relative to the config file (or metadata's

@@ -78,6 +78,8 @@ pub struct ToolsConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TailwindConfig {
+    /// Explicit opt-in; other settings alone do not enable the compiler.
+    pub enable: bool,
     pub input: Option<PathBuf>,
     pub output: Option<PathBuf>,
     pub version: Option<String>,
@@ -214,11 +216,14 @@ impl Options {
         };
         let base = config_path.as_deref().and_then(Path::parent).unwrap_or(cwd);
         let tailwind = config.tools.tailwindcss;
-        // Presence must be checked before defaults: an empty table is not opt-in.
-        let tailwindcss = if tailwind.input.is_some()
-            || tailwind.output.is_some()
-            || tailwind.version.is_some()
+        if !tailwind.enable
+            && (tailwind.input.is_some() || tailwind.output.is_some() || tailwind.version.is_some())
         {
+            eprintln!(
+                "warning: tools.tailwindcss options are set but enable = false; Tailwind CSS is disabled and these options are ignored. Set tools.tailwindcss.enable = true to enable it."
+            );
+        }
+        let tailwindcss = if tailwind.enable {
             Some(TailwindOptions {
                 input: absolute(
                     base,
@@ -514,7 +519,15 @@ mod tests {
             config: Some(path.clone()),
             ..Default::default()
         };
-        for source in ["", "[tools]", "[tools.tailwindcss]"] {
+        for source in [
+            "",
+            "[tools]",
+            "[tools.tailwindcss]",
+            "[tools.tailwindcss]\ninput = 'styles.css'",
+            "[tools.tailwindcss]\noutput = 'dist/styles.css'",
+            "[tools.tailwindcss]\nversion = '4.0.0'",
+            "[tools.tailwindcss]\nenable = false\ninput = 'styles.css'\noutput = 'dist/styles.css'\nversion = '4.0.0'",
+        ] {
             fs::write(&path, source).unwrap();
             assert!(
                 Options::resolve_in(&args, temp.path())
@@ -524,11 +537,16 @@ mod tests {
             );
         }
         for setting in [
+            "",
             "input = 'styles.css'",
             "output = 'public/app.css'",
             "version = '4.0.0'",
         ] {
-            fs::write(&path, format!("[tools.tailwindcss]\n{setting}\n")).unwrap();
+            fs::write(
+                &path,
+                format!("[tools.tailwindcss]\nenable = true\n{setting}\n"),
+            )
+            .unwrap();
             let tailwind = Options::resolve_in(&args, temp.path())
                 .unwrap()
                 .tailwindcss
@@ -557,6 +575,8 @@ mod tests {
             );
         }
         for invalid in [
+            "[tools.tailwindcss]\nenable = 'true'",
+            "[tools.tailwindcss]\nenable = 1",
             "[tools.tailwindcss]\ninput = 123",
             "[tools.tailwindcss]\nversion = 4",
             "[tools.tailwindcss]\nminfy = true",
@@ -566,7 +586,7 @@ mod tests {
         }
         let absolute = temp.path().join("absolute.css");
         let config = format!(
-            "[tools.tailwindcss]\ninput = {}\noutput = {}\n",
+            "[tools.tailwindcss]\nenable = true\ninput = {}\noutput = {}\n",
             toml::Value::String(absolute.to_string_lossy().into_owned()),
             toml::Value::String(absolute.to_string_lossy().into_owned())
         );
@@ -582,7 +602,7 @@ mod tests {
     #[test]
     fn tailwind_configuration_is_also_supported_in_cargo_metadata() {
         let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("Cargo.toml"), "[package]\nname = 'app'\nversion = '0.1.0'\n[package.metadata.sycamore.tools.tailwindcss]\ninput = 'styles.css'\noutput = 'dist/site.css'\nversion = '4.0.0'\n").unwrap();
+        fs::write(temp.path().join("Cargo.toml"), "[package]\nname = 'app'\nversion = '0.1.0'\n[package.metadata.sycamore.tools.tailwindcss]\nenable = true\ninput = 'styles.css'\noutput = 'dist/site.css'\nversion = '4.0.0'\n").unwrap();
         let options = Options::resolve_in(&BuildArgs::default(), temp.path()).unwrap();
         let tailwind = options.tailwindcss.unwrap();
         assert_eq!(tailwind.input, temp.path().join("styles.css"));
