@@ -35,7 +35,22 @@ pub fn watch(args: &BuildArgs) -> Result<()> {
     // Install watches before building so edits during a build aren't lost.
     report_build(&options);
     loop {
-        wait_for_change(&receiver, &plan, DEBOUNCE)?;
+        let changed = wait_for_change(&receiver, &plan, DEBOUNCE)?;
+        if changed.is_empty() {
+            eprintln!("Filesystem rescan requested; checking for changes...");
+        } else {
+            let paths = changed
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&plan.workspace)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("Changed: {paths}");
+        }
         // Reload file configuration on every rebuild, including changes to the
         // manifest/output paths. Keep the existing watches if resolution fails.
         let resolved = Options::resolve(args).and_then(|options| {
@@ -131,15 +146,27 @@ impl WatchPlan {
         ) {
             return false;
         }
-        event.paths.iter().any(|path| {
-            let path = normalize(path);
-            if self.config.as_ref() == Some(&path) {
-                return true;
-            }
-            path.starts_with(&self.workspace)
+        event
+            .paths
+            .iter()
+            .any(|path| self.relevant_path(&normalize(path)))
+    }
+
+    fn relevant_path(&self, path: &Path) -> bool {
+        self.config.as_deref() == Some(path)
+            || (path.starts_with(&self.workspace)
                 && !path.components().any(|part| part.as_os_str() == ".git")
-                && !self.ignored.iter().any(|ignored| path.starts_with(ignored))
-        })
+                && !self.ignored.iter().any(|ignored| path.starts_with(ignored)))
+    }
+
+    fn collect_paths(&self, event: &Event, paths: &mut BTreeSet<PathBuf>) {
+        paths.extend(
+            event
+                .paths
+                .iter()
+                .map(|path| normalize(path))
+                .filter(|path| self.relevant_path(path)),
+        );
     }
 }
 
@@ -171,13 +198,15 @@ fn wait_for_change(
     receiver: &Receiver<WatchEvent>,
     plan: &WatchPlan,
     debounce: Duration,
-) -> Result<()> {
+) -> Result<BTreeSet<PathBuf>> {
+    let mut paths = BTreeSet::new();
     loop {
         let event = receiver
             .recv()
             .context("filesystem watcher disconnected")?
             .context("filesystem watcher failed")?;
         if plan.relevant(&event) {
+            plan.collect_paths(&event, &mut paths);
             break;
         }
     }
@@ -185,15 +214,17 @@ fn wait_for_change(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(());
+            return Ok(paths);
         }
         match receiver.recv_timeout(remaining) {
             Ok(event) => {
-                if plan.relevant(&event.context("filesystem watcher failed")?) {
+                let event = event.context("filesystem watcher failed")?;
+                if plan.relevant(&event) {
+                    plan.collect_paths(&event, &mut paths);
                     deadline = Instant::now() + debounce;
                 }
             }
-            Err(RecvTimeoutError::Timeout) => return Ok(()),
+            Err(RecvTimeoutError::Timeout) => return Ok(paths),
             Err(RecvTimeoutError::Disconnected) => anyhow::bail!("filesystem watcher disconnected"),
         }
     }
@@ -336,6 +367,21 @@ mod tests {
             )))
             .unwrap();
         wait_for_change(&receiver, &plan, Duration::from_millis(1)).unwrap();
+    }
+
+    #[test]
+    fn reports_all_changed_paths_once_without_generated_paths() {
+        let plan = plan();
+        let (sender, receiver) = mpsc::channel();
+        let first = plan.workspace.join("src/main.rs");
+        let second = plan.workspace.join("Cargo.toml");
+        for path in [&first, &first, &second, &plan.workspace.join("dist/app.js")] {
+            sender
+                .send(Ok(event(EventKind::Create(CreateKind::File), path.clone())))
+                .unwrap();
+        }
+        let changed = wait_for_change(&receiver, &plan, Duration::from_millis(1)).unwrap();
+        assert_eq!(changed, BTreeSet::from([first, second]));
     }
 
     #[derive(Default)]
