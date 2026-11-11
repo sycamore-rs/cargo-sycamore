@@ -23,20 +23,25 @@ const WASM_TARGET: &str = "wasm32-unknown-unknown";
 /// Build the application, returning the output directory actually used.
 pub fn build(options: &Options) -> Result<PathBuf> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    build_with(options, &cargo, |version| {
-        eprintln!("Ensuring wasm-bindgen-cli {version} is available...");
+    build_with(options, &cargo, |tool, version| {
+        let name = match tool {
+            BuiltinTool::WasmBindgenCli => "wasm-bindgen-cli",
+            BuiltinTool::WasmOpt => "wasm-opt",
+            BuiltinTool::TailwindCss => "tailwindcss",
+        };
+        eprintln!("Ensuring {name} {version} is available...");
         let mut cache = ToolCache::system()?;
         if let Ok(token) = std::env::var("GITHUB_TOKEN") {
             cache = cache.with_github_token(token);
         }
-        cache.ensure(&BuiltinTool::WasmBindgenCli, version)
+        cache.ensure(&tool, version)
     })
 }
 
 fn build_with(
     options: &Options,
     cargo: &OsStr,
-    ensure_bindgen: impl FnOnce(&str) -> Result<PathBuf>,
+    mut ensure_tool: impl FnMut(BuiltinTool, &str) -> Result<PathBuf>,
 ) -> Result<PathBuf> {
     let mut metadata_command = MetadataCommand::new();
     metadata_command.cargo_path(cargo).no_deps();
@@ -126,7 +131,16 @@ fn build_with(
     // Read after building: Cargo may create or update the workspace lockfile.
     let lockfile = metadata.workspace_root.join("Cargo.lock");
     let version = wasm_bindgen_version(lockfile.as_std_path())?;
-    let bindgen = ensure_bindgen(&version)?;
+    let bindgen = ensure_tool(BuiltinTool::WasmBindgenCli, &version)?;
+    // Obtain all tools before bindgen can overwrite an existing served build.
+    let optimizer = if options.release && options.wasm_opt {
+        Some(
+            ensure_tool(BuiltinTool::WasmOpt, &options.wasm_opt_version)
+                .context("ensuring wasm-opt is available (disable with --wasm-opt=false)")?,
+        )
+    } else {
+        None
+    };
     let out_dir = package_output_directory(options, package);
     fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     let output_name = wasm
@@ -145,6 +159,9 @@ fn build_with(
         .status()
         .with_context(|| format!("running {}", bindgen.display()))?;
     ensure!(status.success(), "wasm-bindgen {version} failed ({status})");
+    if let Some(optimizer) = optimizer {
+        optimize_wasm(&out_dir.join(format!("{output_name}_bg.wasm")), &optimizer)?;
+    }
     let project_root = package
         .manifest_path
         .parent()
@@ -152,6 +169,43 @@ fn build_with(
     crate::html::generate(project_root.as_std_path(), &out_dir, output_name)?;
     eprintln!("Built {} → {}", package.name, out_dir.display());
     Ok(out_dir)
+}
+
+/// Optimize the bindgen-generated module, not Cargo's input artifact. Publish
+/// only a successful, nonempty output so a failed optimizer cannot truncate it.
+fn optimize_wasm(wasm: &Path, optimizer: &Path) -> Result<()> {
+    let metadata = fs::metadata(wasm)
+        .with_context(|| format!("reading wasm-bindgen output {}", wasm.display()))?;
+    let output = tempfile::Builder::new()
+        .prefix(".cargo-sycamore-wasm-opt-")
+        .suffix(".wasm")
+        .tempfile_in(wasm.parent().context("WASM output has no parent")?)
+        .context("creating temporary wasm-opt output")?;
+    eprintln!("Optimizing {} with wasm-opt (-Oz)...", wasm.display());
+    let status = Command::new(optimizer)
+        .arg(wasm)
+        .arg("-Oz")
+        .arg("--all-features")
+        // Compact import encoding is not yet supported by browser runtimes.
+        // Keep this after --all-features so the explicit exclusion wins.
+        .arg("--disable-compact-imports")
+        .arg("-o")
+        .arg(output.path())
+        .status()
+        .with_context(|| format!("running wasm-opt {}", optimizer.display()))?;
+    ensure!(
+        status.success(),
+        "wasm-opt failed ({status}); disable with --wasm-opt=false"
+    );
+    ensure!(
+        fs::metadata(output.path())?.len() > 0,
+        "wasm-opt produced empty output"
+    );
+    fs::set_permissions(output.path(), metadata.permissions())?;
+    output
+        .persist(wasm)
+        .with_context(|| format!("publishing optimized {}", wasm.display()))?;
+    Ok(())
 }
 
 /// Resolve the same output directory as build, without compiling anything.
@@ -560,14 +614,16 @@ mod tests {
             let options = Options {
                 manifest_path: Some(root.join("Cargo.toml")),
                 release: true,
+                wasm_opt: false,
                 features: vec!["csr".into(), "extra".into()],
                 default_features: false,
                 ..Default::default()
             };
-            build_with(&options, cargo.as_os_str(), |version| {
+            build_with(&options, cargo.as_os_str(), |tool, version| {
+                assert!(matches!(tool, BuiltinTool::WasmBindgenCli));
                 assert_eq!(version, "0.2.100");
                 assert!(root.join("cargo-args").exists());
-                Ok(bindgen)
+                Ok(bindgen.clone())
             })
             .unwrap();
             let args = fs::read_to_string(root.join("cargo-args")).unwrap();
@@ -582,6 +638,128 @@ mod tests {
             let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
             assert!(html.contains("./test_app.js"));
             assert!(args.contains("--out-name\ntest_app\n"));
+        }
+
+        #[test]
+        fn release_optimizes_bindgen_output_for_applications_and_examples() {
+            for example in [false, true] {
+                let temp = fixture();
+                let root = temp.path();
+                if example {
+                    fs::create_dir(root.join("examples")).unwrap();
+                    fs::write(root.join("examples/counter.rs"), "fn main() {}\n").unwrap();
+                }
+                let name = if example { "counter" } else { "test_app" };
+                let cargo = mock_cargo_target(root, false, example.then_some("counter"));
+                fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
+                let out = root.join("custom-output");
+                let module = out.join(format!("{name}_bg.wasm"));
+                let bindgen = root.join("wasm-bindgen");
+                script(
+                    &bindgen,
+                    &format!("printf 'bindgen wasm' > {}", quote(&module)),
+                );
+                let optimizer = root.join("wasm-opt");
+                script(
+                    &optimizer,
+                    &format!(
+                        "printf '%s\\n' \"$@\" > {}\n[ \"$#\" -eq 6 ]\n[ \"$2\" = -Oz ]\n[ \"$3\" = --all-features ]\n[ \"$4\" = --disable-compact-imports ]\n[ \"$5\" = -o ]\ncp \"$1\" \"$6\"\nprintf optimized >> \"$6\"",
+                        quote(root.join("opt-args"))
+                    ),
+                );
+                let options = Options {
+                    manifest_path: Some(root.join("Cargo.toml")),
+                    release: true,
+                    example: example.then(|| "counter".into()),
+                    out_dir: Some(out.clone()),
+                    wasm_opt_version: "test-version".into(),
+                    ..Default::default()
+                };
+                let mut tools = Vec::new();
+                let directory = build_with(&options, cargo.as_os_str(), |tool, version| {
+                    tools.push(format!("{tool:?}:{version}"));
+                    match tool {
+                        BuiltinTool::WasmBindgenCli => Ok(bindgen.clone()),
+                        BuiltinTool::WasmOpt => {
+                            assert!(!module.exists(), "download tools before running bindgen");
+                            Ok(optimizer.clone())
+                        }
+                        _ => panic!("unexpected tool"),
+                    }
+                })
+                .unwrap();
+                assert_eq!(directory, out);
+                assert_eq!(tools, ["WasmBindgenCli:0.2.100", "WasmOpt:test-version"]);
+                assert_eq!(fs::read(&module).unwrap(), b"bindgen wasmoptimized");
+                assert_eq!(
+                    fs::read(root.join(format!("custom-target/{name}.wasm"))).unwrap(),
+                    b"fake wasm"
+                );
+                assert!(
+                    fs::read_to_string(root.join("opt-args"))
+                        .unwrap()
+                        .starts_with(&format!(
+                            "{}\n-Oz\n--all-features\n--disable-compact-imports\n-o\n",
+                            module.display()
+                        ))
+                );
+                assert!(out.join("index.html").exists());
+                assert_eq!(
+                    fs::read_dir(out).unwrap().count(),
+                    2,
+                    "temporary optimizer output must not remain"
+                );
+            }
+        }
+
+        #[test]
+        fn optimizer_failure_does_not_publish_output_or_generate_html() {
+            for failure in ["exit", "empty", "download", "missing-executable"] {
+                let temp = fixture();
+                let root = temp.path();
+                let cargo = mock_cargo(root, false);
+                fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
+                let module = root.join("dist/test_app_bg.wasm");
+                if failure == "download" {
+                    fs::create_dir(root.join("dist")).unwrap();
+                    fs::write(&module, b"previous output").unwrap();
+                    fs::write(root.join("dist/index.html"), "previous HTML").unwrap();
+                }
+                let bindgen = root.join("wasm-bindgen");
+                script(&bindgen, &format!("printf original > {}", quote(&module)));
+                let optimizer = root.join("wasm-opt");
+                if failure == "exit" {
+                    script(&optimizer, "printf partial > \"$6\"\nexit 1");
+                }
+                if failure == "empty" {
+                    script(&optimizer, "exit 0");
+                }
+                let options = Options {
+                    manifest_path: Some(root.join("Cargo.toml")),
+                    release: true,
+                    ..Default::default()
+                };
+                let error = build_with(&options, cargo.as_os_str(), |tool, _| match tool {
+                    BuiltinTool::WasmBindgenCli => Ok(bindgen.clone()),
+                    BuiltinTool::WasmOpt if failure == "download" => bail!("download failed"),
+                    BuiltinTool::WasmOpt => Ok(optimizer.clone()),
+                    _ => panic!("unexpected tool"),
+                })
+                .unwrap_err();
+                assert!(format!("{error:#}").contains("wasm-opt"), "{error:#}");
+                if failure == "download" {
+                    assert_eq!(fs::read(&module).unwrap(), b"previous output");
+                    assert_eq!(
+                        fs::read_to_string(root.join("dist/index.html")).unwrap(),
+                        "previous HTML"
+                    );
+                    assert_eq!(fs::read_dir(root.join("dist")).unwrap().count(), 2);
+                } else {
+                    assert_eq!(fs::read(&module).unwrap(), b"original");
+                    assert!(!root.join("dist/index.html").exists());
+                    assert_eq!(fs::read_dir(root.join("dist")).unwrap().count(), 1);
+                }
+            }
         }
 
         #[test]
@@ -605,7 +783,11 @@ mod tests {
                 example: Some("counter".into()),
                 ..Default::default()
             };
-            build_with(&options, cargo.as_os_str(), |_| Ok(bindgen)).unwrap();
+            build_with(&options, cargo.as_os_str(), |tool, _| {
+                assert!(matches!(tool, BuiltinTool::WasmBindgenCli));
+                Ok(bindgen.clone())
+            })
+            .unwrap();
             let args = fs::read_to_string(root.join("cargo-args")).unwrap();
             assert!(args.contains("--example\ncounter\n"));
             assert!(!args.contains("--bin\n"));
@@ -628,7 +810,7 @@ mod tests {
                 manifest_path: Some(temp.path().join("Cargo.toml")),
                 ..Default::default()
             };
-            let error = build_with(&options, cargo.as_os_str(), |_| {
+            let error = build_with(&options, cargo.as_os_str(), |_, _| {
                 panic!("must not download after failed build")
             })
             .unwrap_err();
@@ -648,7 +830,8 @@ mod tests {
                 out_dir: Some(root.join("output")),
                 ..Default::default()
             };
-            let error = build_with(&options, cargo.as_os_str(), |_| Ok(bindgen)).unwrap_err();
+            let error =
+                build_with(&options, cargo.as_os_str(), |_, _| Ok(bindgen.clone())).unwrap_err();
             assert!(error.to_string().contains("wasm-bindgen 0.2.100 failed"));
             assert!(root.join("output").is_dir());
         }

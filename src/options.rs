@@ -10,6 +10,9 @@ use anyhow::{Context, Result, ensure};
 use clap::Args;
 use serde::Deserialize;
 
+/// Pinned Binaryen release used by default for reproducible optimization.
+pub const DEFAULT_WASM_OPT_VERSION: &str = "133";
+
 /// CLI input only. Optional values retain whether the user supplied a flag.
 #[derive(Debug, Default, Args)]
 pub struct BuildArgs {
@@ -28,6 +31,9 @@ pub struct BuildArgs {
     /// Build with Cargo's release profile (CLI only).
     #[arg(long)]
     pub release: bool,
+    /// Optimize release WASM with wasm-opt (default: true; ignored for debug builds).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true, action = clap::ArgAction::Set)]
+    pub wasm_opt: Option<bool>,
     /// Output directory for JS/WASM bindings (also configurable in Sycamore.toml).
     #[arg(long, value_name = "PATH")]
     pub out_dir: Option<PathBuf>,
@@ -81,6 +87,9 @@ pub struct BuildConfig {
     pub features: Vec<String>,
     /// Config-only setting; defaults to true when omitted.
     pub default_features: Option<bool>,
+    pub wasm_opt: Option<bool>,
+    /// Config-only Binaryen version override.
+    pub wasm_opt_version: Option<String>,
 }
 
 /// Final, merged user options. This is neither a clap parser nor a file schema:
@@ -97,6 +106,8 @@ pub struct Options {
     pub release: bool,
     pub features: Vec<String>,
     pub default_features: bool,
+    pub wasm_opt: bool,
+    pub wasm_opt_version: String,
     pub port: u16,
     pub autoreload: bool,
     pub spa: bool,
@@ -114,6 +125,8 @@ impl Default for Options {
             release: false,
             features: Vec::new(),
             default_features: true,
+            wasm_opt: true,
+            wasm_opt_version: DEFAULT_WASM_OPT_VERSION.into(),
             port: 8080,
             autoreload: true,
             spa: false,
@@ -206,6 +219,10 @@ impl Options {
                 .map(|p| absolute(cwd, p))
                 .or_else(|| file.out_dir.as_ref().map(|p| absolute(base, p))),
             release: args.release,
+            wasm_opt: args.wasm_opt.or(file.wasm_opt).unwrap_or(true),
+            wasm_opt_version: file
+                .wasm_opt_version
+                .unwrap_or_else(|| DEFAULT_WASM_OPT_VERSION.into()),
             features: file.features,
             default_features: file.default_features.unwrap_or(true),
             config_path,
@@ -382,6 +399,39 @@ mod tests {
         args.spa = Some(false);
         assert!(!Options::resolve_serve(&args).unwrap().spa);
         assert!(toml::from_str::<Config>("[serve]\nspa = 'true'").is_err());
+    }
+
+    #[test]
+    fn wasm_opt_defaults_and_cli_overrides_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Sycamore.toml");
+        fs::write(&path, "").unwrap();
+        let mut args = BuildArgs {
+            config: Some(path.clone()),
+            ..Default::default()
+        };
+        let options = Options::resolve_in(&args, temp.path()).unwrap();
+        assert!(options.wasm_opt);
+        assert_eq!(options.wasm_opt_version, DEFAULT_WASM_OPT_VERSION);
+        assert!(!options.release);
+        for configured in [false, true] {
+            fs::write(
+                &path,
+                format!("[build]\nwasm-opt = {configured}\nwasm-opt-version = '123'\n"),
+            )
+            .unwrap();
+            args.wasm_opt = None;
+            let options = Options::resolve_in(&args, temp.path()).unwrap();
+            assert_eq!(options.wasm_opt, configured);
+            assert_eq!(options.wasm_opt_version, "123");
+            args.wasm_opt = Some(!configured);
+            assert_eq!(
+                Options::resolve_in(&args, temp.path()).unwrap().wasm_opt,
+                !configured
+            );
+        }
+        assert!(toml::from_str::<Config>("[build]\nwasm-opt = 'false'").is_err());
+        assert!(toml::from_str::<Config>("[build]\nwasm-opt-version = 133").is_err());
     }
 
     #[test]

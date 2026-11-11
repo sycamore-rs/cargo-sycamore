@@ -43,6 +43,8 @@ The build command:
    `Cargo.lock` **after** Cargo creates/updates it.
 4. Automatically downloads/caches that version of `wasm-bindgen-cli` and runs
    it with `--target web` on the actual WASM artifact reported by Cargo.
+5. For release builds, downloads/caches Binaryen's `wasm-opt` and optimizes the
+   generated `*_bg.wasm` with `-Oz` before generating HTML or announcing success.
 
 Generated HTML, JavaScript, and WASM go into the package's `dist/` directory by default.
 TypeScript declarations are disabled with wasm-bindgen's `--no-typescript` flag. An explicit `--out-dir` is relative to the current
@@ -54,11 +56,45 @@ and path/git overrides produce an error rather than guessing an incompatible
 CLI version. Multiple versions anywhere in the workspace lockfile must currently
 be unified, even if only one is used by the selected app.
 
-Only `wasm-bindgen-cli` is downloaded by `build` for now. The command generates
-an HTML entrypoint and WASM web bindings, but does not bundle/copy CSS or other
+Debug builds download only `wasm-bindgen-cli`; release builds also download
+`wasm-opt` unless disabled. The command generates an HTML entrypoint and WASM web
+bindings, but does not bundle/copy CSS or other
 static assets. Use `serve` for the development server. Existing files in the output directory
 are not cleaned. Set `GITHUB_TOKEN` if needed for GitHub API
 rate limits; it is passed to the downloader for API requests only.
+
+### Release WASM optimization
+
+`--release` enables `wasm-opt` by default, including in `watch`, `serve`, and
+example builds. Debug builds never download or run it, even with `--wasm-opt=true`.
+
+```sh
+cargo sycamore build --release                      # Optimize with wasm-opt.
+cargo sycamore build --release --wasm-opt=false     # Skip optimization.
+cargo sycamore s --release --wasm-opt               # Override disabled config.
+```
+
+Configuration supports an enable/disable setting and a config-only version pin:
+
+```toml
+[build]
+wasm-opt = true
+wasm-opt-version = "133"
+```
+
+CLI `--wasm-opt[=true|false]` overrides `[build].wasm-opt`; omitting the flag
+preserves the configured value (default `true`). The default Binaryen version is
+pinned to `133`, not a moving `latest` release. It uses the existing tool cache and
+platform support; for platforms without compatible Binaryen binaries, disable it
+with `--wasm-opt=false`.
+
+Optimization runs after wasm-bindgen using
+`-Oz --all-features --disable-compact-imports` on its generated module, leaving
+Cargo's original artifact unchanged. Compact imports are explicitly disabled
+because browser runtimes do not yet support that encoding. The optimizer writes to a
+temporary file and replaces the module only after success. Download or optimizer
+failures fail the build; watch/serve report an error and do not trigger a successful
+browser reload. Optimization may increase release rebuild times.
 
 ### HTML entrypoint
 
@@ -278,6 +314,8 @@ output directory and selects the release profile.
 | Features | — | `features` | `[]` |
 | Default features | — | `default-features` | `true` |
 | Release profile | `--release` | — | debug |
+| Release WASM optimization | `--wasm-opt` | `wasm-opt` | `true` (release only) |
+| Binaryen version | — | `wasm-opt-version` | `"133"` |
 | Config file | `--config` | — | nearest `Sycamore.toml` |
 
 Server settings live under `[serve]`: `port` corresponds to the serve-only

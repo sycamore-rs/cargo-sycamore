@@ -197,6 +197,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_wasm_opt_for_build_watch_serve_and_aliases() {
+        for command in ["build", "b", "watch", "w", "serve", "s"] {
+            for (flags, expected) in [
+                (vec![], None),
+                (vec!["--wasm-opt"], Some(true)),
+                (vec!["--wasm-opt=true"], Some(true)),
+                (vec!["--wasm-opt=false"], Some(false)),
+            ] {
+                let mut argv = vec!["cargo-sycamore", command, "--release"];
+                argv.extend(flags);
+                let args = match parse(&argv).unwrap().command {
+                    Command::Build(args) | Command::Watch(args) => args,
+                    Command::Serve(args) => args.build,
+                    _ => unreachable!(),
+                };
+                assert_eq!(args.wasm_opt, expected);
+                assert!(args.release);
+            }
+        }
+        assert!(parse(&["cargo-sycamore", "build", "--wasm-opt=invalid"]).is_err());
+        assert!(parse(&["cargo-sycamore", "build", "--wasm-opt-version", "133"]).is_err());
+    }
+
+    #[test]
     fn parses_spa_flag_and_explicit_overrides() {
         for command in ["serve", "s"] {
             for (flag, expected) in [
