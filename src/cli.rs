@@ -16,6 +16,7 @@ pub enum Command {
     #[command(visible_alias = "b")]
     Build(cargo_sycamore::options::BuildArgs),
     /// Watch the workspace and rebuild when files change.
+    #[command(visible_alias = "w")]
     Watch(cargo_sycamore::options::BuildArgs),
     /// Create a new Sycamore application (not yet implemented).
     New {
@@ -136,6 +137,19 @@ mod tests {
         ] {
             assert!(matches!(parse(&args).unwrap().command,
                 Command::Watch(options) if options.release && options.config == Some(PathBuf::from("custom.toml"))));
+        }
+    }
+
+    #[test]
+    fn accepts_watch_shorthand() {
+        for args in [
+            vec!["cargo-sycamore", "w", "--release"],
+            vec!["cargo-sycamore", "sycamore", "w", "--release"],
+        ] {
+            assert!(matches!(
+                parse(&args).unwrap().command,
+                Command::Watch(options) if options.release
+            ));
         }
     }
 
