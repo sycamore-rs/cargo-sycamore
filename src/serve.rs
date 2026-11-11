@@ -46,15 +46,25 @@ pub fn serve(args: ServeArgs) -> Result<()> {
         .enable_all()
         .build()
         .context("creating development server runtime")?;
-    runtime.block_on(serve_async(args, options.port, directory))
+    runtime.block_on(serve_async(
+        args,
+        options.port,
+        options.autoreload,
+        directory,
+    ))
 }
 
-async fn serve_async(args: ServeArgs, port: u16, directory: PathBuf) -> Result<()> {
+async fn serve_async(
+    args: ServeArgs,
+    port: u16,
+    autoreload: bool,
+    directory: PathBuf,
+) -> Result<()> {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
         .await
         .with_context(|| format!("binding development server on port {port}"))?;
     let address = listener.local_addr()?;
-    let state = Arc::new(ServerState::new(directory, address.port()));
+    let state = Arc::new(ServerState::new(directory, address.port(), autoreload));
     let app = router(Arc::clone(&state));
     eprintln!(
         "Serving {} at http://{address} (Ctrl-C to stop)",
@@ -89,10 +99,11 @@ struct ServerState {
     revision: updates::Sender<u64>,
     session: String,
     port: u16,
+    autoreload: bool,
 }
 
 impl ServerState {
-    fn new(directory: PathBuf, port: u16) -> Self {
+    fn new(directory: PathBuf, port: u16, autoreload: bool) -> Self {
         let (revision, _) = updates::channel(0);
         Self {
             root: RwLock::new(directory),
@@ -107,6 +118,7 @@ impl ServerState {
                     .as_nanos()
             ),
             port,
+            autoreload,
         }
     }
 
@@ -133,10 +145,14 @@ impl ServerState {
 }
 
 fn router(state: Arc<ServerState>) -> Router {
-    Router::new()
-        .route("/__sycamore/reload", get(reload))
-        .route("/__sycamore/reload.js", get(reload_client))
-        .fallback(static_file)
+    let app = Router::new();
+    let app = if state.autoreload {
+        app.route("/__sycamore/reload", get(reload))
+            .route("/__sycamore/reload.js", get(reload_client))
+    } else {
+        app
+    };
+    app.fallback(static_file)
         .layer(middleware::from_fn_with_state(Arc::clone(&state), guard))
         .with_state(state)
 }
@@ -251,7 +267,7 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
         Ok(path) => path,
         Err(status) => return status.into_response(),
     };
-    if mime_guess::from_path(&path).first_raw() == Some("text/html") {
+    if state.autoreload && mime_guess::from_path(&path).first_raw() == Some("text/html") {
         let template = match tokio::fs::read_to_string(&path).await {
             Ok(template) => template,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -364,7 +380,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let original = "<!doctype html><title>App</title><main>Hello</main>";
         fs::write(temp.path().join("index.html"), original).unwrap();
-        let state = Arc::new(ServerState::new(temp.path().to_owned(), 8080));
+        let state = Arc::new(ServerState::new(temp.path().to_owned(), 8080, true));
         let version = state.version(0);
         let app = router(state);
         let response = request(&app, Method::GET, "/?cache=1").await;
@@ -409,11 +425,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabling_autoreload_serves_unmodified_html_without_reload_endpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = "<main>Original output</main>";
+        fs::write(temp.path().join("index.html"), original).unwrap();
+        let state = Arc::new(ServerState::new(temp.path().to_owned(), 8080, false));
+        let app = router(Arc::clone(&state));
+        assert_eq!(text(request(&app, Method::GET, "/").await).await, original);
+        for path in ["/__sycamore/reload", "/__sycamore/reload.js"] {
+            assert_eq!(
+                request(&app, Method::GET, path).await.status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+        // Disabling browser reload must not disable successful-build output updates.
+        let next = temp.path().join("next");
+        fs::create_dir(&next).unwrap();
+        fs::write(next.join("index.html"), "new output").unwrap();
+        state.built(&next).unwrap();
+        assert_eq!(
+            text(request(&app, Method::GET, "/").await).await,
+            "new output"
+        );
+    }
+
+    #[tokio::test]
     async fn streams_assets_with_types_ranges_and_head() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("app_bg.wasm"), b"wasm").unwrap();
         fs::write(temp.path().join("my file.js"), "export default 1;").unwrap();
-        let app = router(Arc::new(ServerState::new(temp.path().to_owned(), 8080)));
+        let app = router(Arc::new(ServerState::new(
+            temp.path().to_owned(),
+            8080,
+            true,
+        )));
         let response = request(&app, Method::GET, "/app_bg.wasm").await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/wasm");
@@ -533,7 +578,11 @@ mod tests {
     #[tokio::test]
     async fn rejects_untrusted_http_host() {
         let temp = tempfile::tempdir().unwrap();
-        let app = router(Arc::new(ServerState::new(temp.path().to_owned(), 8080)));
+        let app = router(Arc::new(ServerState::new(
+            temp.path().to_owned(),
+            8080,
+            true,
+        )));
         let response = app
             .oneshot(
                 Request::builder()
@@ -569,7 +618,11 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let origin = format!("http://{address}");
-        let state = Arc::new(ServerState::new(temp.path().to_owned(), address.port()));
+        let state = Arc::new(ServerState::new(
+            temp.path().to_owned(),
+            address.port(),
+            true,
+        ));
         // Publish before anyone subscribes: the handshake must still get revision 1.
         state.built(temp.path()).unwrap();
         let app = router(Arc::clone(&state));

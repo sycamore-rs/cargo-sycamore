@@ -144,6 +144,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_autoreload_without_overriding_config_when_flag_is_absent() {
+        for (flag, expected) in [
+            ("--autoreload", true),
+            ("--autoreload=true", true),
+            ("--autoreload=false", false),
+        ] {
+            let cli = parse(&["cargo-sycamore", "sycamore", "s", flag, "--port", "9000"]).unwrap();
+            assert!(matches!(cli.command, Command::Serve(args)
+                if args.autoreload == Some(expected) && args.port == Some(9000)));
+        }
+        assert!(
+            matches!(parse(&["cargo-sycamore", "serve"]).unwrap().command,
+            Command::Serve(args) if args.autoreload.is_none())
+        );
+        assert!(parse(&["cargo-sycamore", "serve", "--autoreload=invalid"]).is_err());
+        assert!(parse(&["cargo-sycamore", "build", "--autoreload"]).is_err());
+    }
+
+    #[test]
     fn accepts_serve_shorthand() {
         for args in [
             vec!["cargo-sycamore", "s", "--port", "9000"],

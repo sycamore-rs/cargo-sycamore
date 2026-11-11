@@ -38,9 +38,12 @@ pub struct BuildArgs {
 pub struct ServeArgs {
     #[command(flatten)]
     pub build: BuildArgs,
-    /// Local HTTP port (also configurable as [serve].port).
+    /// Local HTTP port (default: 8080; also configurable as [serve].port).
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
+    /// Automatically reload browsers after successful builds (default: true).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true, action = clap::ArgAction::Set)]
+    pub autoreload: Option<bool>,
 }
 
 /// File input only. CLI-only settings intentionally cannot be deserialized.
@@ -55,6 +58,7 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct ServeConfig {
     pub port: Option<u16>,
+    pub autoreload: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -84,6 +88,7 @@ pub struct Options {
     pub features: Vec<String>,
     pub default_features: bool,
     pub port: u16,
+    pub autoreload: bool,
 }
 
 impl Default for Options {
@@ -98,6 +103,7 @@ impl Default for Options {
             features: Vec::new(),
             default_features: true,
             port: 8080,
+            autoreload: true,
         }
     }
 }
@@ -116,6 +122,9 @@ impl Options {
         let mut options = Self::resolve(&args.build)?;
         if let Some(port) = args.port {
             options.port = port;
+        }
+        if let Some(autoreload) = args.autoreload {
+            options.autoreload = autoreload;
         }
         Ok(options)
     }
@@ -160,6 +169,7 @@ impl Options {
             default_features: file.default_features.unwrap_or(true),
             config_path,
             port: config.serve.port.unwrap_or(8080),
+            autoreload: config.serve.autoreload.unwrap_or(true),
         })
     }
 }
@@ -202,6 +212,7 @@ mod tests {
                 ..Default::default()
             },
             port: None,
+            autoreload: None,
         };
         assert_eq!(Options::resolve_serve(&args).unwrap().port, 8080);
         fs::write(&path, "[serve]\nport = 9000\n").unwrap();
@@ -216,6 +227,29 @@ mod tests {
         ] {
             assert!(toml::from_str::<Config>(config).is_err());
         }
+    }
+
+    #[test]
+    fn autoreload_defaults_and_cli_overrides_both_config_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Sycamore.toml");
+        fs::write(&path, "").unwrap();
+        let mut args = ServeArgs {
+            build: BuildArgs {
+                config: Some(path.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(Options::resolve_serve(&args).unwrap().autoreload);
+        fs::write(&path, "[serve]\nautoreload = false\n").unwrap();
+        assert!(!Options::resolve_serve(&args).unwrap().autoreload);
+        args.autoreload = Some(true);
+        assert!(Options::resolve_serve(&args).unwrap().autoreload);
+        fs::write(&path, "[serve]\nautoreload = true\n").unwrap();
+        args.autoreload = Some(false);
+        assert!(!Options::resolve_serve(&args).unwrap().autoreload);
+        assert!(toml::from_str::<Config>("[serve]\nautoreload = 'false'").is_err());
     }
 
     #[test]

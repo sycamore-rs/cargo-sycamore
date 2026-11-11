@@ -153,7 +153,15 @@ Configure the port in `Sycamore.toml`:
 ```toml
 [serve]
 port = 9000
+autoreload = true
 ```
+
+Autoreload defaults to `true`. Set `[serve].autoreload = false` to disable browser
+reloads while continuing to watch and rebuild. Override either config value with
+`--autoreload` (enable), `--autoreload=true`, or `--autoreload=false` (disable).
+Like the port, this setting takes effect when `serve` starts; restart after changing it.
+When disabled, HTML is served without a reload client and the reload endpoints are
+not registered.
 
 `--port` overrides `[serve].port`; otherwise the default is 8080. The port is fixed
 at startup, so restart `serve` after changing it. Port 0 asks the OS for a free
@@ -212,7 +220,8 @@ output directory and selects the release profile.
 | Config file | `--config` | — | nearest `Sycamore.toml` |
 
 Server settings live under `[serve]`: `port` corresponds to the serve-only
-`--port` flag and defaults to 8080.
+`--port` flag and defaults to 8080. `autoreload` corresponds to `--autoreload` and
+defaults to `true`. Both CLI overrides preserve config values when omitted.
 
 Configuration is optional. Discovery starts in the directory containing the
 CLI-supplied `--manifest-path`, or the current directory when that flag is absent,

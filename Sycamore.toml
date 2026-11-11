@@ -16,3 +16,5 @@ default-features = true
 [serve]
 # May be overridden with `cargo sycamore serve --port 9000`.
 port = 8080
+# Browser reload after successful builds; rebuilding remains enabled when false.
+autoreload = true
