@@ -32,6 +32,8 @@ cargo sycamore build --package my-app --bin client --out-dir public
 cargo sycamore build --help
 ```
 
+Settings can also come from `Sycamore.toml`; see [Configuration](#configuration).
+
 The build command:
 
 1. Selects a workspace package using Cargo's default members (or `--package`).
@@ -56,6 +58,61 @@ Only `wasm-bindgen-cli` is downloaded by `build` for now. This is a WASM + web
 bindings build, not an HTML/CSS bundler or development server. Existing files in
 the output directory are not cleaned. Set `GITHUB_TOKEN` if needed for GitHub API
 rate limits; it is passed to the downloader for API requests only.
+
+## Configuration
+
+Create a `Sycamore.toml` in your project (a commented template is included here):
+
+```toml
+[build]
+# May also be supplied as CLI flags:
+manifest-path = "Cargo.toml"
+package = "my-app"
+# bin = "client"
+out-dir = "dist"
+
+# Config only; these are not CLI flags:
+features = ["csr"]
+default-features = true
+```
+
+The precedence is **explicit CLI flags → configuration → built-in defaults**.
+For example, `cargo sycamore b --out-dir public --release` overrides the configured
+output directory and selects the release profile.
+
+| Option | CLI | `Sycamore.toml` (`[build]`) | Default |
+| --- | --- | --- | --- |
+| Manifest | `--manifest-path` | `manifest-path` | Cargo's current project |
+| Package | `--package` / `-p` | `package` | Cargo's default members |
+| Binary | `--bin` | `bin` | cdylib or sole binary |
+| Output | `--out-dir` | `out-dir` | `<package>/dist` |
+| Features | — | `features` | `[]` |
+| Default features | — | `default-features` | `true` |
+| Release profile | `--release` | — | debug |
+| Config file | `--config` | — | nearest `Sycamore.toml` |
+
+Configuration is optional. Discovery starts in the directory containing the
+CLI-supplied `--manifest-path`, or the current directory when that flag is absent,
+then searches ancestors for the nearest `Sycamore.toml`. Only that file is loaded;
+parent and child files are not layered. Use `--config path/to/Sycamore.toml` to
+select a file explicitly (a missing explicit file is an error).
+
+CLI paths, including `--config`, are relative to your current working directory.
+Paths written **inside** the config are relative to the directory containing that
+file. A config file doesn't change the current project unless it sets
+`manifest-path`. Without an output override, output still defaults to the selected
+package's `dist/` directory.
+
+Unknown keys, malformed values, and CLI-only keys such as `release` in the config
+are errors. Set `default-features = false` to pass `--no-default-features` to Cargo;
+`features` is passed as Cargo's feature list.
+
+`src/options.rs` keeps three separate types:
+
+- `BuildArgs`: clap CLI input, preserving absent flags as `Option` values.
+- `Config` / `BuildConfig`: the supported TOML schema, without CLI-only fields.
+- `Options`: the final merged values consumed by the build command, independent
+  of where each value came from.
 
 ## Other commands
 

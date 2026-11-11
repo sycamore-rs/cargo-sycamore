@@ -1,0 +1,14 @@
+# Optional project configuration for cargo-sycamore.
+# CLI flags override matching values here. Paths are relative to this file.
+[build]
+# Shared with CLI flags:
+# manifest-path = "Cargo.toml"
+# package = "my-app"
+# bin = "client"
+# out-dir = "dist"
+
+# Config-only options:
+features = []
+default-features = true
+
+# `release` is deliberately CLI-only: use `cargo sycamore build --release`.

@@ -8,7 +8,9 @@ fn main() -> ExitCode {
     let cli = Cli::parse_args();
 
     match cli.command {
-        Command::Build(options) => match cargo_sycamore::build::build(&options) {
+        Command::Build(args) => match cargo_sycamore::options::Options::resolve(&args)
+            .and_then(|options| cargo_sycamore::build::build(&options))
+        {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("error: {error:#}");

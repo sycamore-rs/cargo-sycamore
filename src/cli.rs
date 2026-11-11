@@ -14,7 +14,7 @@ pub struct Cli {
 pub enum Command {
     /// Build a WASM application and generate web bindings.
     #[command(visible_alias = "b")]
-    Build(cargo_sycamore::build::BuildOptions),
+    Build(cargo_sycamore::options::BuildArgs),
     /// Create a new Sycamore application (not yet implemented).
     New {
         /// Directory for the new application.
@@ -95,6 +95,22 @@ mod tests {
             parse(&["cargo-sycamore", "build"]).unwrap().command,
             Command::Build(_)
         ));
+    }
+
+    #[test]
+    fn config_only_options_are_not_cli_flags() {
+        for flag in ["--features", "--default-features", "--no-default-features"] {
+            assert_eq!(
+                parse(&["cargo-sycamore", "build", flag])
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::UnknownArgument
+            );
+        }
+        let cli = parse(&["cargo-sycamore", "b", "--config", "custom.toml"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Build(args) if args.config == Some(PathBuf::from("custom.toml")))
+        );
     }
 
     #[test]
