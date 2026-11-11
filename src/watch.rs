@@ -57,7 +57,7 @@ pub(crate) fn validate(options: &Options) -> Result<()> {
 }
 
 pub fn watch(args: &BuildArgs) -> Result<()> {
-    watch_with(args, |_| Ok(()))
+    watch_with(args, Options::resolve(args)?, |_| Ok(()))
 }
 
 #[derive(Debug)]
@@ -67,11 +67,13 @@ pub(crate) enum BuildEvent<'a> {
     Failed,
 }
 
+// Reuse the caller's startup snapshot: serve already resolved it (and emitted
+// any config warnings). Only subsequent file changes should resolve it again.
 pub(crate) fn watch_with(
     args: &BuildArgs,
+    options: Options,
     mut on_event: impl FnMut(BuildEvent<'_>) -> Result<()>,
 ) -> Result<()> {
-    let options = Options::resolve(args)?;
     let mut plan = WatchPlan::new(&options)?;
     let (sender, receiver) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |event| {
@@ -400,6 +402,37 @@ mod tests {
         )
         .add_path(output);
         assert!(!plan.relevant(&event));
+    }
+
+    #[test]
+    fn watcher_reuses_resolved_options_for_the_initial_build() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = 'app'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "").unwrap();
+        let options = Options {
+            manifest_path: Some(temp.path().join("Cargo.toml")),
+            ..Default::default()
+        };
+        // If startup resolves args again, this nonexistent config will fail
+        // before our callback. Reusing the supplied snapshot reaches Started.
+        let args = BuildArgs {
+            config: Some(temp.path().join("missing.toml")),
+            ..Default::default()
+        };
+        let mut started = false;
+        let error = watch_with(&args, options, |event| {
+            assert!(matches!(event, BuildEvent::Started));
+            started = true;
+            anyhow::bail!("stop before the initial build")
+        })
+        .unwrap_err();
+        assert!(started);
+        assert_eq!(error.to_string(), "stop before the initial build");
     }
 
     #[test]

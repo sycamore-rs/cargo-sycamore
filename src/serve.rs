@@ -46,28 +46,17 @@ pub fn serve(args: ServeArgs) -> Result<()> {
         .enable_all()
         .build()
         .context("creating development server runtime")?;
-    runtime.block_on(serve_async(
-        args,
-        options.port,
-        options.autoreload,
-        options.spa,
-        directory,
-    ))
+    runtime.block_on(serve_async(args, options, directory))
 }
 
-async fn serve_async(
-    args: ServeArgs,
-    port: u16,
-    autoreload: bool,
-    spa: bool,
-    directory: PathBuf,
-) -> Result<()> {
+async fn serve_async(args: ServeArgs, options: Options, directory: PathBuf) -> Result<()> {
+    let port = options.port;
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
         .await
         .with_context(|| format!("binding development server on port {port}"))?;
     let address = listener.local_addr()?;
-    let mut state = ServerState::new(directory, address.port(), autoreload);
-    state.spa = spa;
+    let mut state = ServerState::new(directory, address.port(), options.autoreload);
+    state.spa = options.spa;
     let state = Arc::new(state);
     let app = router(Arc::clone(&state));
     eprintln!(
@@ -83,7 +72,7 @@ async fn serve_async(
     std::thread::Builder::new()
         .name("sycamore-watch".into())
         .spawn(move || {
-            let result = watch::watch_with(&args.build, |event| match event {
+            let result = watch::watch_with(&args.build, options, |event| match event {
                 watch::BuildEvent::Started => {
                     state.set_phase(BuildPhase::Building);
                     Ok(())
