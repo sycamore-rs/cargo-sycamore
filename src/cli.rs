@@ -12,7 +12,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Build a WASM application and generate web bindings.
+    /// Build the WASM client and an optional native application server.
     #[command(visible_alias = "b")]
     Build(cargo_sycamore::options::BuildArgs),
     /// Watch the workspace and rebuild when files change.

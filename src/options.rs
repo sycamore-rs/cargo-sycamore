@@ -105,28 +105,54 @@ pub struct TailwindOptions {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ServeConfig {
     pub port: Option<u16>,
     pub autoreload: Option<bool>,
     /// Fallback to index.html for missing pages.
-    pub spa: bool,
+    pub spa: Option<bool>,
+    pub serve_frontend: Option<bool>,
+    pub backend_port: Option<u16>,
+    pub forward_routes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildMode {
+    #[default]
+    Spa,
+    Ssr,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ClientBuildConfig {
+    pub package: Option<String>,
+    pub bin: Option<String>,
+    pub example: Option<String>,
+    pub features: Vec<String>,
+    pub default_features: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ServerBuildConfig {
+    pub package: Option<String>,
+    pub bin: Option<String>,
+    pub features: Vec<String>,
+    pub default_features: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct BuildConfig {
+    pub mode: BuildMode,
+    pub client: ClientBuildConfig,
+    pub server: Option<ServerBuildConfig>,
     pub manifest_path: Option<PathBuf>,
-    pub package: Option<String>,
-    pub bin: Option<String>,
-    pub example: Option<String>,
     pub out_dir: Option<PathBuf>,
     /// Config-only static files and directories to copy into the output.
     pub assets: Vec<crate::assets::AssetConfig>,
-    /// Config-only Cargo feature selection.
-    pub features: Vec<String>,
-    /// Config-only setting; defaults to true when omitted.
-    pub default_features: Option<bool>,
 }
 
 impl TailwindOptions {
@@ -143,6 +169,15 @@ impl TailwindOptions {
         );
         Ok(out_dir.join(path))
     }
+}
+
+/// Resolved server target settings.
+#[derive(Debug, Clone)]
+pub struct ServerOptions {
+    pub package: Option<String>,
+    pub bin: Option<String>,
+    pub features: Vec<String>,
+    pub default_features: bool,
 }
 
 /// Final, merged user options. This is neither a clap parser nor a file schema:
@@ -166,6 +201,12 @@ pub struct Options {
     pub port: u16,
     pub autoreload: bool,
     pub spa: bool,
+    pub mode: BuildMode,
+    pub server: Option<ServerOptions>,
+    pub serve_frontend: bool,
+    pub backend_port: Option<u16>,
+    pub forward_routes: Vec<String>,
+    pub spa_explicit: bool,
 }
 
 impl Default for Options {
@@ -187,11 +228,55 @@ impl Default for Options {
             port: 8080,
             autoreload: true,
             spa: false,
+            mode: BuildMode::Spa,
+            server: None,
+            serve_frontend: true,
+            backend_port: None,
+            forward_routes: Vec::new(),
+            spa_explicit: false,
         }
     }
 }
 
 impl Options {
+    /// Validate options that only affect serving, not compilation.
+    pub fn validate_serve(&self) -> Result<()> {
+        ensure!(
+            self.mode != BuildMode::Ssr || !self.serve_frontend,
+            "SSR mode cannot serve the frontend"
+        );
+        if !self.serve_frontend || !self.forward_routes.is_empty() {
+            ensure!(
+                self.server.is_some(),
+                "backend serving requires [build.server]"
+            );
+        }
+        if self.server.is_some() {
+            let backend_port = self
+                .backend_port
+                .context("configured [build.server] requires [serve].backend-port")?;
+            ensure!(backend_port != 0, "[serve].backend-port must be nonzero");
+            ensure!(
+                backend_port != self.port,
+                "[serve].backend-port must differ from [serve].port"
+            );
+        }
+        if !self.serve_frontend {
+            ensure!(
+                !self.spa_explicit,
+                "[serve].spa cannot be specified in backend-only mode"
+            );
+            ensure!(
+                self.forward_routes.is_empty(),
+                "[serve].forward-routes cannot be used in backend-only mode"
+            );
+        }
+        for route in &self.forward_routes {
+            validate_route_prefix(route)?;
+        }
+        Ok(())
+    }
+
     /// Resolve flags over the nearest configuration, then apply defaults.
     /// An explicit --package starts discovery at that workspace package's root.
     /// CLI paths are relative to cwd; config paths are relative to the config file.
@@ -212,7 +297,9 @@ impl Options {
         }
         if let Some(spa) = args.spa {
             options.spa = spa;
+            options.spa_explicit = true;
         }
+        options.validate_serve()?;
         Ok(options)
     }
 
@@ -273,24 +360,37 @@ impl Options {
             args.bin.is_none() || args.example.is_none(),
             "--bin and --example are mutually exclusive"
         );
+        let client = file.client;
         // A CLI target selector overrides the configured target selector as a
         // group, so --example can replace a configured bin (and vice versa).
         let (bin, example) = if args.bin.is_some() || args.example.is_some() {
             (args.bin.clone(), args.example.clone())
         } else {
-            (file.bin, file.example)
+            (client.bin, client.example)
         };
         ensure!(
             bin.is_none() || example.is_none(),
-            "configure either [build].bin or [build].example, not both"
+            "configure either [build.client].bin or [build.client].example, not both"
         );
+        let server = file.server.map(|server| ServerOptions {
+            package: server.package,
+            bin: server.bin,
+            features: server.features,
+            default_features: server.default_features.unwrap_or(true),
+        });
+        ensure!(
+            file.mode != BuildMode::Ssr || server.is_some(),
+            "[build].mode = 'ssr' requires [build.server]"
+        );
+        let mode = file.mode;
+        let spa_explicit = config.serve.spa.is_some();
         Ok(Self {
             manifest_path: args
                 .manifest_path
                 .as_ref()
                 .map(|p| absolute(cwd, p))
                 .or_else(|| file.manifest_path.as_ref().map(|p| absolute(base, p))),
-            package: args.package.clone().or(file.package),
+            package: args.package.clone().or(client.package),
             bin,
             example,
             out_dir: args
@@ -308,15 +408,46 @@ impl Options {
             wasm_opt_version: wasm_opt
                 .version
                 .unwrap_or_else(|| DEFAULT_WASM_OPT_VERSION.into()),
-            features: file.features,
-            default_features: file.default_features.unwrap_or(true),
+            features: client.features,
+            default_features: client.default_features.unwrap_or(true),
             tailwindcss,
             config_path,
             port: config.serve.port.unwrap_or(8080),
             autoreload: config.serve.autoreload.unwrap_or(true),
-            spa: config.serve.spa,
+            spa: config.serve.spa.unwrap_or(false),
+            mode,
+            server,
+            serve_frontend: config
+                .serve
+                .serve_frontend
+                .unwrap_or(mode == BuildMode::Spa),
+            backend_port: config.serve.backend_port,
+            forward_routes: config.serve.forward_routes,
+            spa_explicit,
         })
     }
+}
+
+fn validate_route_prefix(route: &str) -> Result<()> {
+    ensure!(
+        route.starts_with('/'),
+        "forward route prefix '{route}' must be an absolute path"
+    );
+    ensure!(
+        !route.contains('?') && !route.contains('#'),
+        "forward route prefix '{route}' cannot contain a query or fragment"
+    );
+    ensure!(
+        !route
+            .split('/')
+            .any(|segment| segment == "." || segment == ".."),
+        "forward route prefix '{route}' cannot contain traversal components"
+    );
+    ensure!(
+        !route.split('/').any(|segment| segment == "__sycamore"),
+        "forward route prefix '{route}' uses the reserved __sycamore path"
+    );
+    Ok(())
 }
 
 fn absolute(base: &Path, path: &Path) -> PathBuf {
@@ -491,7 +622,7 @@ mod tests {
             config: Some(path.clone()),
             ..Default::default()
         };
-        fs::write(&path, "[build]\nexample = 'counter'\n").unwrap();
+        fs::write(&path, "[build.client]\nexample = 'counter'\n").unwrap();
         let options = Options::resolve(&args).unwrap();
         assert_eq!(options.example.as_deref(), Some("counter"));
         assert!(options.bin.is_none());
@@ -505,7 +636,7 @@ mod tests {
         let options = Options::resolve(&args).unwrap();
         assert_eq!(options.bin.as_deref(), Some("client"));
         assert!(options.example.is_none());
-        fs::write(&path, "[build]\nbin = 'client'\n").unwrap();
+        fs::write(&path, "[build.client]\nbin = 'client'\n").unwrap();
         args.bin = None;
         args.example = Some("counter".into());
         let options = Options::resolve(&args).unwrap();
@@ -515,7 +646,11 @@ mod tests {
         assert!(Options::resolve(&args).is_err());
         args.bin = None;
         args.example = None;
-        fs::write(&path, "[build]\nbin = 'client'\nexample = 'counter'\n").unwrap();
+        fs::write(
+            &path,
+            "[build.client]\nbin = 'client'\nexample = 'counter'\n",
+        )
+        .unwrap();
         assert!(Options::resolve(&args).is_err());
     }
 
@@ -727,11 +862,12 @@ mod tests {
             r#"
     [build]
     manifest-path = "app/Cargo.toml"
+    out-dir = "output"
+    assets = ["images", { from = "public", to = "." }, { from = "logo.svg", to = "img/brand.svg" }]
+    [build.client]
     package = "configured-package"
     bin = "configured-bin"
-    out-dir = "output"
     features = ["csr", "extra"]
-    assets = ["images", { from = "public", to = "." }, { from = "logo.svg", to = "img/brand.svg" }]
     default-features = false
     "#,
         )
@@ -783,12 +919,12 @@ mod tests {
         fs::create_dir_all(member.join("src")).unwrap();
         fs::write(
             temp.path().join("Sycamore.toml"),
-            "[build]\npackage = 'root'\n",
+            "[build.client]\npackage = 'root'\n",
         )
         .unwrap();
         fs::write(
             member.join("Sycamore.toml"),
-            "[build]\npackage = 'member'\n",
+            "[build.client]\npackage = 'member'\n",
         )
         .unwrap();
         let options = Options::resolve_in(&BuildArgs::default(), &member.join("src")).unwrap();
@@ -820,8 +956,9 @@ version = "0.1.0"
 [package.metadata.unrelated]
 anything = true
 [package.metadata.sycamore.build]
-bin = "app"
 out-dir = "web-dist"
+[package.metadata.sycamore.build.client]
+bin = "app"
 features = ["csr"]
 default-features = false
 [package.metadata.sycamore.tools.wasm-opt]
@@ -866,7 +1003,7 @@ spa = true
         package_workspace(root);
         fs::write(
             root.join("Sycamore.toml"),
-            "[build]\nfeatures = ['root']\n[serve]\nspa = true\n",
+            "[build.client]\nfeatures = ['root']\n[serve]\nspa = true\n",
         )
         .unwrap();
         let member = root.join("apps/frontend");
@@ -935,6 +1072,212 @@ spa = true
         assert!(Options::resolve_in(&args, root).unwrap().spa);
     }
 
+    #[test]
+    fn build_modes_and_targets_resolve() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Sycamore.toml");
+        let args = BuildArgs {
+            config: Some(path.clone()),
+            ..Default::default()
+        };
+        fs::write(&path, "").unwrap();
+        let options = Options::resolve_in(&args, temp.path()).unwrap();
+        assert_eq!(options.mode, BuildMode::Spa);
+        assert!(options.serve_frontend);
+        assert!(options.server.is_none());
+
+        fs::write(
+            &path,
+            r#"
+[build]
+mode = "ssr"
+[build.client]
+package = "web"
+example = "demo"
+features = ["hydrate"]
+default-features = false
+[build.server]
+package = "backend"
+bin = "http"
+features = ["server"]
+default-features = false
+"#,
+        )
+        .unwrap();
+        let options = Options::resolve_in(&args, temp.path()).unwrap();
+        assert_eq!(options.mode, BuildMode::Ssr);
+        assert_eq!(options.package.as_deref(), Some("web"));
+        assert_eq!(options.example.as_deref(), Some("demo"));
+        assert_eq!(options.features, ["hydrate"]);
+        assert!(!options.default_features);
+        assert!(!options.serve_frontend);
+        let server = options.server.unwrap();
+        assert_eq!(server.package.as_deref(), Some("backend"));
+        assert_eq!(server.bin.as_deref(), Some("http"));
+        assert_eq!(server.features, ["server"]);
+        assert!(!server.default_features);
+
+        let args = BuildArgs {
+            example: Some("cli-demo".into()),
+            ..args
+        };
+        let options = Options::resolve_in(&args, temp.path()).unwrap();
+        assert_eq!(options.example.as_deref(), Some("cli-demo"));
+        assert!(options.bin.is_none());
+
+        for source in ["[build]\nmode = 'ssr'", "[build]\nmode = 'unknown'"] {
+            fs::write(&path, source).unwrap();
+            assert!(
+                Options::resolve_in(
+                    &BuildArgs {
+                        config: Some(path.clone()),
+                        ..Default::default()
+                    },
+                    temp.path()
+                )
+                .is_err(),
+                "{source}"
+            );
+        }
+        fs::write(
+            &path,
+            "[build.client]\nfeatures = ['client']\ndefault-features = false\n",
+        )
+        .unwrap();
+        let options = Options::resolve_in(&args, temp.path()).unwrap();
+        assert_eq!(options.features, ["client"]);
+        assert!(!options.default_features);
+    }
+
+    #[test]
+    fn serve_validation_is_separate_from_build_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Sycamore.toml");
+        let args = ServeArgs {
+            build: BuildArgs {
+                config: Some(path.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        fs::write(&path, "[build]\nmode = 'ssr'\n[build.server]\npackage = 'backend'\n[serve]\nbackend-port = 9000\n").unwrap();
+        let build = Options::resolve_in(&args.build, temp.path()).unwrap();
+        assert_eq!(build.mode, BuildMode::Ssr);
+        assert!(!build.serve_frontend);
+        assert!(!Options::resolve_serve(&args).unwrap().serve_frontend);
+        fs::write(&path, "[build]\nmode = 'ssr'\n[build.server]\npackage = 'backend'\n[serve]\nbackend-port = 9000\nserve-frontend = true\n").unwrap();
+        assert!(
+            Options::resolve_serve(&args).is_err(),
+            "SSR cannot serve the frontend"
+        );
+
+        fs::write(&path, "[build]\nmode = 'spa'\n[build.server]\npackage = 'backend'\n[serve]\nserve-frontend = false\nbackend-port = 9000\n").unwrap();
+        assert!(!Options::resolve_serve(&args).unwrap().serve_frontend);
+        for serve in [
+            "serve-frontend = false",
+            "serve-frontend = false\nbackend-port = 0",
+            "serve-frontend = false\nbackend-port = 8080",
+            "serve-frontend = false\nbackend-port = 9000\nspa = false",
+            "serve-frontend = false\nbackend-port = 9000\nforward-routes = ['/api']",
+        ] {
+            fs::write(
+                &path,
+                format!("[build.server]\npackage = 'backend'\n[serve]\n{serve}\n"),
+            )
+            .unwrap();
+            assert!(Options::resolve_serve(&args).is_err(), "{serve}");
+        }
+        for route in [
+            "api",
+            "/api?x=1",
+            "/api#fragment",
+            "/api/../admin",
+            "/__sycamore",
+            "/x/__sycamore/y",
+        ] {
+            fs::write(&path, format!("[build.server]\npackage = 'backend'\n[serve]\nbackend-port = 9000\nforward-routes = ['{route}']\n")).unwrap();
+            assert!(Options::resolve_serve(&args).is_err(), "{route}");
+        }
+        fs::write(&path, "[build.server]\npackage = 'backend'\n[serve]\nbackend-port = 9000\nforward-routes = ['/api', '/v1']\n").unwrap();
+        let options = Options::resolve_serve(&args).unwrap();
+        assert_eq!(options.forward_routes, ["/api", "/v1"]);
+        assert!(options.serve_frontend);
+        assert!(!options.spa);
+        assert!(!options.spa_explicit);
+    }
+
+    #[test]
+    fn configured_server_requires_a_distinct_explicit_serve_port_only_for_serve() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Sycamore.toml");
+        let build_args = BuildArgs {
+            config: Some(path.clone()),
+            ..Default::default()
+        };
+        let serve_args = ServeArgs {
+            build: BuildArgs {
+                config: Some(path.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        fs::write(&path, "[build.server]\npackage = 'backend'\n").unwrap();
+        assert!(Options::resolve_in(&build_args, temp.path()).is_ok());
+        assert!(Options::resolve_serve(&serve_args).is_err());
+
+        for backend_port in [0, 8080] {
+            fs::write(
+                &path,
+                format!(
+                    "[build.server]\npackage = 'backend'\n[serve]\nbackend-port = {backend_port}\n"
+                ),
+            )
+            .unwrap();
+            assert!(Options::resolve_in(&build_args, temp.path()).is_ok());
+            assert!(Options::resolve_serve(&serve_args).is_err());
+        }
+
+        fs::write(
+            &path,
+            "[build.server]\npackage = 'backend'\n[serve]\nbackend-port = 9000\n",
+        )
+        .unwrap();
+        assert!(Options::resolve_in(&build_args, temp.path()).is_ok());
+        let serving = Options::resolve_serve(&serve_args).unwrap();
+        assert!(serving.serve_frontend);
+        assert!(serving.forward_routes.is_empty());
+        assert_eq!(serving.backend_port, Some(9000));
+    }
+
+    #[test]
+    fn build_and_serve_settings_deserialize_from_cargo_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"
+[package]
+name = "app"
+version = "0.1.0"
+[package.metadata.sycamore.build]
+mode = "ssr"
+[package.metadata.sycamore.build.server]
+package = "backend"
+features = ["http"]
+[package.metadata.sycamore.serve]
+backend-port = 9000
+"#,
+        )
+        .unwrap();
+        let options = Options::resolve_in(&BuildArgs::default(), temp.path()).unwrap();
+        assert_eq!(options.mode, BuildMode::Ssr);
+        assert_eq!(options.server.unwrap().features, ["http"]);
+        assert_eq!(options.backend_port, Some(9000));
+        assert!(!options.serve_frontend);
+    }
+
     fn package_workspace(root: &Path) {
         fs::create_dir_all(root).unwrap();
         fs::write(
@@ -959,7 +1302,7 @@ spa = true
         let temp = tempfile::tempdir().unwrap();
         package_workspace(temp.path());
         let member = temp.path().join("apps/frontend");
-        fs::write(temp.path().join("Sycamore.toml"), "[build]\npackage = 'other'\nfeatures = ['root']\ndefault-features = false\n[serve]\nspa = true\nport = 9090\n").unwrap();
+        fs::write(temp.path().join("Sycamore.toml"), "[build.client]\npackage = 'other'\nfeatures = ['root']\ndefault-features = false\n[serve]\nspa = true\nport = 9090\n").unwrap();
         fs::write(
             member.join("Sycamore.toml"),
             "[build]\nout-dir = 'local-dist'\n",
@@ -1051,12 +1394,12 @@ spa = true
         let temp = tempfile::tempdir().unwrap();
         fs::write(
             temp.path().join("Sycamore.toml"),
-            "[build]\npackage = 'discovered'\n",
+            "[build.client]\npackage = 'discovered'\n",
         )
         .unwrap();
         fs::write(
             temp.path().join("custom.toml"),
-            "[build]\npackage = 'explicit'\n",
+            "[build.client]\npackage = 'explicit'\n",
         )
         .unwrap();
         let args = BuildArgs {
@@ -1083,7 +1426,7 @@ spa = true
             "[build]\nrelease = true",
             "[build]\nconfig = 'other.toml'",
             "[build]\nout_dir = 'typo'",
-            "[build]\ndefault-features = 'not a boolean'",
+            "[build.client]\ndefault-features = 'not a boolean'",
             "[unknown]\nvalue = true",
             "broken [toml",
         ] {

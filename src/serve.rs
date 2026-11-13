@@ -3,7 +3,7 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Component, Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -29,9 +29,10 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
 use crate::{
+    backend::BackendSupervisor,
     build, html,
     options::{Options, ServeArgs},
-    watch,
+    proxy, watch,
 };
 
 const RELOAD_CLIENT: &str = include_str!("reload.js");
@@ -57,7 +58,18 @@ async fn serve_async(args: ServeArgs, options: Options, directory: PathBuf) -> R
     let address = listener.local_addr()?;
     let mut state = ServerState::new(directory, address.port(), options.autoreload);
     state.spa = options.spa;
+    state
+        .published
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    *state
+        .configuration
+        .get_mut()
+        .expect("new configuration lock") = Some(ServeConfiguration::from(&options));
     let state = Arc::new(state);
+    let backend = Arc::new(Mutex::new(BackendSupervisor::new()));
+    let backend_shutdown = Arc::clone(&backend);
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_watch = Arc::clone(&shutdown);
     let app = router(Arc::clone(&state));
     eprintln!(
         "Serving {} at http://{address} (Ctrl-C to stop)",
@@ -69,15 +81,44 @@ async fn serve_async(args: ServeArgs, options: Options, directory: PathBuf) -> R
     );
 
     let (sender, stopped) = oneshot::channel();
+    let backend_monitor = Arc::clone(&backend);
+    let monitoring_state = Arc::clone(&state);
     std::thread::Builder::new()
         .name("sycamore-watch".into())
         .spawn(move || {
-            let result = watch::watch_with(&args.build, options, |event| match event {
+            let resolve = || Options::resolve_serve(&args);
+            let result = watch::watch_with_resolver(options, resolve, |event| match event {
                 watch::BuildEvent::Started => {
                     state.set_phase(BuildPhase::Building);
                     Ok(())
                 }
-                watch::BuildEvent::Succeeded(directory) => state.built(directory),
+                watch::BuildEvent::Succeeded { output, options } => {
+                    let mut backend = backend
+                        .lock()
+                        .map_err(|_| anyhow!("backend lock poisoned"))?;
+                    if shutdown_watch.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    // The public listener cannot change ports without restarting
+                    // the command, even when the config is reloaded.
+                    anyhow::ensure!(
+                        options.backend_port != Some(state.port),
+                        "backend-port must differ from the public development port"
+                    );
+                    if options.port != state.port && options.port != 0 {
+                        eprintln!("warning: restart serve to change the public port");
+                    }
+                    let generation = snapshot_frontend(&output.directory)?;
+                    if let Some(executable) = &output.server {
+                        let port = options.backend_port.ok_or_else(|| {
+                            anyhow!("[serve].backend-port is required to run the backend")
+                        })?;
+                        backend.restart(executable, &output.directory, port)?;
+                    } else {
+                        backend.stop()?;
+                    }
+                    state.publish(generation, options)
+                }
                 watch::BuildEvent::Failed => {
                     state.set_phase(BuildPhase::Failed);
                     Ok(())
@@ -87,13 +128,80 @@ async fn serve_async(args: ServeArgs, options: Options, directory: PathBuf) -> R
         })
         .context("starting build watcher")?;
 
-    tokio::select! {
-        result = async { axum::serve(listener, app).await } => result.context("serving HTTP"),
-        result = stopped => result.context("build watcher stopped unexpectedly")?.context("build watcher stopped"),
-        result = tokio::signal::ctrl_c() => {
-            result.context("listening for Ctrl-C")?;
-            Ok(())
+    let monitor = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            interval.tick().await;
+            // Restart/readiness runs on the watcher thread. Never wait for its
+            // blocking lock on an async worker.
+            if let Ok(mut backend) = backend_monitor.try_lock()
+                && let Err(error) = backend.check()
+            {
+                eprintln!("error: {error:#}\nWaiting for changes...");
+                monitoring_state.set_phase(BuildPhase::Failed);
+            }
         }
+    });
+    let result = tokio::select! {
+        result = async { axum::serve(listener, app).await } => result.context("serving HTTP"),
+        result = stopped => match result {
+            Ok(result) => result.context("build watcher stopped"),
+            Err(error) => Err(error).context("build watcher stopped unexpectedly"),
+        },
+        result = tokio::signal::ctrl_c() => result.context("listening for Ctrl-C"),
+    };
+    monitor.abort();
+    shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    // No backend is left detached if the HTTP server, watcher, or signal exits.
+    let stop = tokio::task::spawn_blocking(move || {
+        backend_shutdown
+            .lock()
+            .map_err(|_| anyhow!("backend lock poisoned"))?
+            .stop()
+    })
+    .await
+    .context("joining backend shutdown")?;
+    result.and(stop)
+}
+
+// Publish only complete successful generations. Subsequent builds may write
+// into out-dir without replacing the currently served frontend.
+fn snapshot_frontend(directory: &Path) -> Result<tempfile::TempDir> {
+    let generation = tempfile::Builder::new()
+        .prefix("cargo-sycamore-frontend-")
+        .tempdir()?;
+    crate::backend::copy_public_directory(directory, generation.path())?;
+    Ok(generation)
+}
+
+#[derive(Clone, Debug)]
+struct ServeConfiguration {
+    serve_frontend: bool,
+    backend_port: Option<u16>,
+    forward_routes: Vec<String>,
+    spa: bool,
+    autoreload: bool,
+}
+
+impl From<&Options> for ServeConfiguration {
+    fn from(options: &Options) -> Self {
+        Self {
+            serve_frontend: options.serve_frontend,
+            backend_port: options.backend_port,
+            forward_routes: options.forward_routes.clone(),
+            spa: options.spa,
+            autoreload: options.autoreload,
+        }
+    }
+}
+
+impl ServeConfiguration {
+    fn forwards(&self, path: &str) -> bool {
+        !self.serve_frontend
+            || self
+                .forward_routes
+                .iter()
+                .any(|route| proxy::matches_route(path, route))
     }
 }
 
@@ -117,6 +225,9 @@ struct ServerState {
     port: u16,
     autoreload: bool,
     spa: bool,
+    configuration: RwLock<Option<ServeConfiguration>>,
+    generation: Mutex<Option<Arc<tempfile::TempDir>>>,
+    published: std::sync::atomic::AtomicBool,
 }
 
 impl ServerState {
@@ -140,7 +251,41 @@ impl ServerState {
             port,
             autoreload,
             spa: false,
+            configuration: RwLock::new(None),
+            generation: Mutex::new(None),
+            published: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    fn configuration(&self) -> ServeConfiguration {
+        self.configuration
+            .read()
+            .expect("configuration lock poisoned")
+            .clone()
+            .unwrap_or_else(|| ServeConfiguration {
+                serve_frontend: true,
+                backend_port: None,
+                forward_routes: Vec::new(),
+                spa: self.spa,
+                autoreload: self.autoreload,
+            })
+    }
+
+    fn publish(&self, generation: tempfile::TempDir, options: &Options) -> Result<()> {
+        let mut previous = self
+            .generation
+            .lock()
+            .map_err(|_| anyhow!("frontend generation lock poisoned"))?;
+        *self
+            .configuration
+            .write()
+            .map_err(|_| anyhow!("configuration lock poisoned"))? =
+            Some(ServeConfiguration::from(options));
+        self.built(generation.path())?;
+        self.published
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *previous = Some(Arc::new(generation));
+        Ok(())
     }
 
     fn version(&self, revision: u64) -> String {
@@ -186,14 +331,10 @@ impl ServerState {
 }
 
 fn router(state: Arc<ServerState>) -> Router {
-    let app = Router::new();
-    let app = if state.autoreload {
-        app.route("/__sycamore/reload", get(reload))
-            .route("/__sycamore/reload.js", get(reload_client))
-    } else {
-        app
-    };
-    app.fallback(static_file)
+    let app = Router::new()
+        .route("/__sycamore/reload", get(reload))
+        .route("/__sycamore/reload.js", get(reload_client));
+    app.fallback(application)
         .layer(middleware::from_fn_with_state(Arc::clone(&state), guard))
         .with_state(state)
 }
@@ -234,28 +375,47 @@ async fn guard(State(state): State<Arc<ServerState>>, request: Request, next: Ne
     if !allowed_host(request.headers(), state.port) {
         return StatusCode::MISDIRECTED_REQUEST.into_response();
     }
+    let local = routing_path(request.uri().path()).is_ok_and(|path| {
+        proxy::matches_route(&path, "/__sycamore") || !state.configuration().forwards(&path)
+    });
     let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if local {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     response
 }
 
-async fn reload_client() -> impl IntoResponse {
+async fn reload_client(State(state): State<Arc<ServerState>>) -> Response {
+    if !state.configuration().autoreload {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         RELOAD_CLIENT,
     )
+        .into_response()
 }
 
 async fn reload(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
+    upgrade: std::result::Result<
+        WebSocketUpgrade,
+        axum::extract::ws::rejection::WebSocketUpgradeRejection,
+    >,
 ) -> Response {
+    if !state.configuration().autoreload {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if !allowed_origin(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let upgrade = match upgrade {
+        Ok(upgrade) => upgrade,
+        Err(error) => return error.into_response(),
+    };
     let revisions = state.revision.subscribe();
     upgrade
         .max_message_size(1024)
@@ -275,7 +435,7 @@ async fn reload_socket(
     loop {
         tokio::select! {
             changed = revisions.changed() => {
-                if changed.is_err() { break; }
+                if changed.is_err() || !state.configuration().autoreload { break; }
                 let message = state.message(*revisions.borrow_and_update());
                 if socket.send(Message::Text(message.into())).await.is_err() { break; }
             }
@@ -290,7 +450,52 @@ async fn reload_socket(
     }
 }
 
+fn routing_path(path: &str) -> std::result::Result<std::borrow::Cow<'_, str>, StatusCode> {
+    let decoded = percent_decode_str(path)
+        .decode_utf8()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if decoded.contains(['\\', '\0']) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if decoded.split('/').any(|part| part == "." || part == "..") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(decoded)
+}
+
+async fn application(State(state): State<Arc<ServerState>>, request: Request) -> Response {
+    if proxy::matches_route(request.uri().path(), "/__sycamore") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !state.published.load(std::sync::atomic::Ordering::SeqCst) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Waiting for the first successful build",
+        )
+            .into_response();
+    }
+    let configuration = state.configuration();
+    let path = match routing_path(request.uri().path()) {
+        Ok(path) => path,
+        Err(status) => return status.into_response(),
+    };
+    if proxy::matches_route(&path, "/__sycamore") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if configuration.forwards(&path) {
+        let Some(port) = configuration.backend_port else {
+            return StatusCode::BAD_GATEWAY.into_response();
+        };
+        let version = configuration
+            .autoreload
+            .then(|| state.version(state.revision.borrow().revision));
+        return proxy::forward(request, port, version).await;
+    }
+    static_file(State(state), request).await
+}
+
 async fn static_file(State(state): State<Arc<ServerState>>, request: Request) -> Response {
+    let configuration = state.configuration();
     if !matches!(*request.method(), Method::GET | Method::HEAD) {
         return (
             StatusCode::METHOD_NOT_ALLOWED,
@@ -300,17 +505,26 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
     }
     // Capture the revision before reading HTML. A build between this snapshot
     // and the WebSocket handshake is detected by the client's initial version.
-    let (directory, version) = match state.root.read() {
-        Ok(root) => (
-            root.clone(),
-            state.version(state.revision.borrow().revision),
-        ),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    // Hold this generation alive for the whole request, even if another build
+    // replaces it while we are opening or streaming a file.
+    let (directory, version, _generation) = {
+        let generation = match state.generation.lock() {
+            Ok(generation) => generation,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        match state.root.read() {
+            Ok(root) => (
+                root.clone(),
+                state.version(state.revision.borrow().revision),
+                generation.clone(),
+            ),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
     };
     let (path, spa_fallback) = match resolve_file(&directory, request.uri().path()).await {
         Ok(path) => (path, false),
         Err(StatusCode::NOT_FOUND)
-            if state.spa && !request.uri().path().starts_with("/__sycamore/") =>
+            if configuration.spa && !proxy::matches_route(request.uri().path(), "/__sycamore") =>
         {
             match resolve_file(&directory, "/index.html").await {
                 Ok(path) => (path, true),
@@ -319,7 +533,7 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
         }
         Err(status) => return status.into_response(),
     };
-    if (state.autoreload || spa_fallback)
+    if (configuration.autoreload || spa_fallback)
         && mime_guess::from_path(&path).first_raw() == Some("text/html")
     {
         let template = match tokio::fs::read_to_string(&path).await {
@@ -332,7 +546,7 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
             } else {
                 template
             };
-            if state.autoreload {
+            if configuration.autoreload {
                 html::with_reload_client(&template, &version)
             } else {
                 Ok(template)
@@ -439,6 +653,330 @@ mod tests {
                 .to_vec(),
         )
         .unwrap()
+    }
+
+    async fn start_backend(app: Router) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (port, task)
+    }
+
+    fn proxy_state(
+        directory: &Path,
+        backend_port: u16,
+        serve_frontend: bool,
+        autoreload: bool,
+    ) -> ServerState {
+        let mut state = ServerState::new(directory.to_owned(), 8080, autoreload);
+        *state.configuration.get_mut().unwrap() = Some(ServeConfiguration {
+            serve_frontend,
+            backend_port: Some(backend_port),
+            forward_routes: vec!["/api".into()],
+            spa: true,
+            autoreload,
+        });
+        state
+    }
+
+    #[tokio::test]
+    async fn forwards_api_before_static_and_spa_without_hiding_backend_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("index.html"), "SPA shell").unwrap();
+        fs::create_dir(temp.path().join("api")).unwrap();
+        fs::write(temp.path().join("api/index.html"), "must not serve this").unwrap();
+        let (port, task) = start_backend(Router::new().fallback(|request: Request| async move {
+            let method = request.method().clone();
+            let uri = request.uri().clone();
+            let body = to_bytes(request.into_body(), 1024).await.unwrap();
+            (
+                StatusCode::NOT_FOUND,
+                [(header::CACHE_CONTROL, "private, max-age=60")],
+                format!("{method} {uri} {}", String::from_utf8_lossy(&body)),
+            )
+        }))
+        .await;
+        let app = router(Arc::new(proxy_state(temp.path(), port, true, false)));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/users?sort=asc")
+                    .header(header::HOST, "localhost:8080")
+                    .body(Body::from("payload"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, max-age=60"
+        );
+        assert_eq!(text(response).await, "POST /api/users?sort=asc payload");
+        for encoded in ["/%61pi/users", "/api%2Fusers"] {
+            let response = request(&app, Method::GET, encoded).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, max-age=60"
+            );
+        }
+        assert_eq!(
+            request(&app, Method::GET, "/api/%2e%2e/private")
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(
+            text(request(&app, Method::GET, "/apiary").await)
+                .await
+                .contains("SPA shell")
+        );
+        assert_eq!(
+            request(&app, Method::GET, "/__sycamore/unknown")
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn backend_only_forwards_assets_and_redirects_without_changing_responses() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("app.js"), "wrong local asset").unwrap();
+        let (port, task) = start_backend(Router::new().fallback(|request: Request| async move {
+            if request.uri().path() == "/redirect" {
+                (
+                    StatusCode::FOUND,
+                    [
+                        (header::LOCATION, "/destination"),
+                        (header::CACHE_CONTROL, "max-age=30"),
+                    ],
+                    "redirect",
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/javascript"),
+                        (header::CACHE_CONTROL, "max-age=60"),
+                    ],
+                    "backend asset",
+                )
+            }
+        }))
+        .await;
+        let app = router(Arc::new(proxy_state(temp.path(), port, false, true)));
+        let response = request(&app, Method::GET, "/app.js").await;
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "max-age=60");
+        assert_eq!(text(response).await, "backend asset");
+        let response = request(&app, Method::GET, "/redirect").await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(response.headers()[header::LOCATION], "/destination");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "max-age=30");
+        assert_eq!(text(response).await, "redirect");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn backend_html_gets_reload_without_buffering_or_stale_length_and_validators() {
+        let temp = tempfile::tempdir().unwrap();
+        let (port, task) = start_backend(Router::new().fallback(|| async {
+            let stream =
+                futures_util::stream::once(async { Ok::<_, std::io::Error>("<html><body>SSR") })
+                    .chain(futures_util::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        Ok::<_, std::io::Error>("</body></html>")
+                    }));
+            (
+                [
+                    (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                    (header::ETAG, "\"old\""),
+                ],
+                Body::from_stream(stream),
+            )
+        }))
+        .await;
+        let state = Arc::new(proxy_state(temp.path(), port, false, true));
+        let version = state.version(0);
+        let app = router(state);
+        let response = request(&app, Method::GET, "/posts/1").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+        assert!(!response.headers().contains_key(header::ETAG));
+        let mut stream = response.into_body().into_data_stream();
+        let first = timeout(Duration::from_millis(100), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("SSR"));
+        let mut rest = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            rest.extend_from_slice(&chunk.unwrap());
+        }
+        let rest = String::from_utf8(rest).unwrap();
+        assert!(rest.contains("/__sycamore/reload.js"));
+        assert!(rest.contains(&version));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn forwards_application_websockets_with_subprotocol() {
+        use futures_util::SinkExt;
+        let (backend_port, backend_task) = start_backend(Router::new().route(
+            "/api/socket",
+            get(|headers: HeaderMap, upgrade: WebSocketUpgrade| async move {
+                assert_eq!(headers.get_all(header::HOST).iter().count(), 1);
+                assert_eq!(headers[header::HOST], headers["x-forwarded-host"]);
+                upgrade
+                    .protocols(["app-v1"])
+                    .on_upgrade(|mut socket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            if socket.send(message).await.is_err() {
+                                break;
+                            }
+                        }
+                    })
+            }),
+        ))
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut state = proxy_state(temp.path(), backend_port, true, true);
+        state.port = address.port();
+        let app = router(Arc::new(state));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut upgrade = format!("ws://{address}/api/socket?token=1")
+            .into_client_request()
+            .unwrap();
+        upgrade
+            .headers_mut()
+            .insert("sec-websocket-protocol", "app-v1".parse().unwrap());
+        let (mut socket, response) = connect_async(upgrade).await.unwrap();
+        assert_eq!(response.headers()["sec-websocket-protocol"], "app-v1");
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                "hello".into(),
+            ))
+            .await
+            .unwrap();
+        let message = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.into_text().unwrap(), "hello");
+        socket.close(None).await.unwrap();
+        server.abort();
+        backend_task.abort();
+    }
+
+    #[tokio::test]
+    async fn rejected_websocket_handshake_preserves_backend_response() {
+        let rejected = "authentication required ".repeat(1024);
+        let body = rejected.clone();
+        let (backend_port, backend_task) = start_backend(Router::new().fallback(move || {
+            let body = body.clone();
+            async move {
+                (
+                    StatusCode::FORBIDDEN,
+                    [
+                        (header::SET_COOKIE, "auth=expired"),
+                        (header::CACHE_CONTROL, "private"),
+                    ],
+                    body,
+                )
+            }
+        }))
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut state = proxy_state(temp.path(), backend_port, false, false);
+        state.port = address.port();
+        let app = router(Arc::new(state));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/socket"))
+            .header(header::CONNECTION, "upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()[header::SET_COOKIE], "auth=expired");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "private");
+        assert_eq!(response.text().await.unwrap(), rejected);
+        server.abort();
+        backend_task.abort();
+    }
+
+    #[tokio::test]
+    async fn serves_only_published_frontend_generations() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("index.html"), "first successful build").unwrap();
+        let state = Arc::new(ServerState::new(temp.path().to_owned(), 8080, false));
+        let options = Options {
+            autoreload: false,
+            ..Default::default()
+        };
+        state
+            .published
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let app = router(Arc::clone(&state));
+        assert_eq!(
+            request(&app, Method::GET, "/").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        state
+            .publish(snapshot_frontend(temp.path()).unwrap(), &options)
+            .unwrap();
+        let app = router(Arc::clone(&state));
+        fs::write(temp.path().join("index.html"), "unpublished partial build").unwrap();
+        state.set_phase(BuildPhase::Failed);
+        assert_eq!(
+            text(request(&app, Method::GET, "/").await).await,
+            "first successful build"
+        );
+        assert_eq!(state.revision.borrow().revision, 1);
+        state
+            .publish(snapshot_frontend(temp.path()).unwrap(), &options)
+            .unwrap();
+        assert_eq!(
+            text(request(&app, Method::GET, "/").await).await,
+            "unpublished partial build"
+        );
+        assert_eq!(state.revision.borrow().revision, 2);
+    }
+
+    #[tokio::test]
+    async fn failed_backend_returns_bad_gateway_instead_of_spa_shell() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("index.html"), "SPA shell").unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let app = router(Arc::new(proxy_state(temp.path(), port, true, false)));
+        assert_eq!(
+            request(&app, Method::GET, "/api/users").await.status(),
+            StatusCode::BAD_GATEWAY
+        );
     }
 
     #[tokio::test]

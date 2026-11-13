@@ -63,7 +63,10 @@ pub fn watch(args: &BuildArgs) -> Result<()> {
 #[derive(Debug)]
 pub(crate) enum BuildEvent<'a> {
     Started,
-    Succeeded(&'a Path),
+    Succeeded {
+        output: &'a build::BuildOutput,
+        options: &'a Options,
+    },
     Failed,
 }
 
@@ -72,6 +75,15 @@ pub(crate) enum BuildEvent<'a> {
 pub(crate) fn watch_with(
     args: &BuildArgs,
     options: Options,
+    on_event: impl FnMut(BuildEvent<'_>) -> Result<()>,
+) -> Result<()> {
+    watch_with_resolver(options, || Options::resolve(args), on_event)
+}
+
+/// Serve supplies its own resolver so serve-only CLI overrides survive rebuilds.
+pub(crate) fn watch_with_resolver(
+    options: Options,
+    mut resolve: impl FnMut() -> Result<Options>,
     mut on_event: impl FnMut(BuildEvent<'_>) -> Result<()>,
 ) -> Result<()> {
     let mut plan = WatchPlan::new(&options)?;
@@ -105,7 +117,7 @@ pub(crate) fn watch_with(
         on_event(BuildEvent::Started)?;
         // Reload file configuration on every rebuild, including changes to the
         // manifest/output paths. Keep the existing watches if resolution fails.
-        let resolved = Options::resolve(args).and_then(|options| {
+        let resolved = resolve().and_then(|options| {
             let next = WatchPlan::new(&options)?;
             Ok((options, next))
         });
@@ -128,8 +140,17 @@ fn report_build(
     options: &Options,
     on_event: &mut impl FnMut(BuildEvent<'_>) -> Result<()>,
 ) -> Result<()> {
-    match build::build(options) {
-        Ok(directory) => on_event(BuildEvent::Succeeded(&directory)),
+    match build::build_application(options) {
+        Ok(output) => {
+            if let Err(error) = on_event(BuildEvent::Succeeded {
+                output: &output,
+                options,
+            }) {
+                eprintln!("error: publishing build: {error:#}\nWaiting for changes...");
+                on_event(BuildEvent::Failed)?;
+            }
+            Ok(())
+        }
         Err(error) => {
             eprintln!("error: {error:#}\nWaiting for changes...");
             on_event(BuildEvent::Failed)

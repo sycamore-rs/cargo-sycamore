@@ -65,18 +65,79 @@ pub(crate) fn generate_with_stylesheet(
 }
 
 fn stylesheet_href(out_dir: &Path, stylesheet: &Path) -> Result<String> {
-    // Build output is already resolved from a validated relative asset path.
-    let relative = stylesheet
+    Ok(format!("./{}", output_url(out_dir, stylesheet)?))
+}
+
+/// Publish the stable browser bootstrap and its public asset manifest.
+/// URLs in the manifest are rooted at the public output root, never filesystem paths.
+pub(crate) fn generate_bootstrap_and_manifest(
+    out_dir: &Path,
+    output_name: &str,
+    stylesheet: Option<&Path>,
+) -> Result<()> {
+    let bootstrap_name = format!("{output_name}.bootstrap.js");
+    let js = format!("{output_name}.js");
+    let wasm = format!("{output_name}_bg.wasm");
+    let js_url = file_url(&js);
+    let bootstrap_url = file_url(&bootstrap_name);
+    let bootstrap = format!(
+        r#"import init from "./{js_url}";
+init().catch(error => console.error("Failed to initialize WASM:", error));
+"#
+    );
+    let mut manifest = format!(
+        r#"{{
+  "bootstrap": "/{bootstrap_url}",
+  "js": "/{js_url}",
+  "wasm": "/{}""#,
+        file_url(&wasm)
+    );
+    if let Some(stylesheet) = stylesheet {
+        manifest.push_str(&format!(
+            ",\n  \"stylesheet\": \"/{}\"",
+            output_url(out_dir, stylesheet)?
+        ));
+    }
+    manifest.push_str("\n}\n");
+    atomic_write(&out_dir.join(bootstrap_name), bootstrap.as_bytes())?;
+    atomic_write(&out_dir.join("sycamore-assets.json"), manifest.as_bytes())?;
+    Ok(())
+}
+
+fn output_url(out_dir: &Path, file: &Path) -> Result<String> {
+    let relative = file
         .strip_prefix(out_dir)
         .context("invalid generated stylesheet path")?;
-    let segments = relative
+    relative
         .iter()
         .map(|segment| {
-            let segment = segment.to_str().context("stylesheet path is not UTF-8")?;
+            let segment = segment.to_str().context("asset path is not UTF-8")?;
             Ok(utf8_percent_encode(segment, ASSET_PATH).to_string())
         })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(format!("./{}", segments.join("/")))
+        .collect::<Result<Vec<_>>>()
+        .map(|segments| segments.join("/"))
+}
+
+fn file_url(file: &str) -> String {
+    utf8_percent_encode(file, ASSET_PATH).to_string()
+}
+
+fn atomic_write(destination: &Path, contents: &[u8]) -> Result<()> {
+    let mut output = tempfile::NamedTempFile::new_in(
+        destination.parent().context("output file has no parent")?,
+    )?;
+    output.write_all(contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        output
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
+    output
+        .persist(destination)
+        .with_context(|| format!("writing {}", destination.display()))?;
+    Ok(())
 }
 
 fn with_stylesheet(template: &str, href: Option<&str>) -> Result<String> {
@@ -270,6 +331,49 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn publishes_bootstrap_and_root_relative_asset_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("dist");
+        fs::create_dir_all(out.join("assets")).unwrap();
+        let stylesheet = out.join("assets/site styles.css");
+        fs::write(&stylesheet, "body{}").unwrap();
+
+        generate_bootstrap_and_manifest(&out, "app name", Some(&stylesheet)).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(out.join("app name.bootstrap.js")).unwrap(),
+            r#"import init from "./app%20name.js";
+init().catch(error => console.error("Failed to initialize WASM:", error));
+"#
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(out.join("sycamore-assets.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["bootstrap"], "/app%20name.bootstrap.js");
+        assert_eq!(manifest["js"], "/app%20name.js");
+        assert_eq!(manifest["wasm"], "/app%20name_bg.wasm");
+        assert_eq!(manifest["stylesheet"], "/assets/site%20styles.css");
+        assert!(!manifest.to_string().contains(out.to_str().unwrap()));
+    }
+
+    #[test]
+    fn sycamore_app_bootstrap_does_not_replace_bindgen_glue() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path();
+        let glue = b"// wasm-bindgen generated glue";
+        fs::write(out.join("sycamore.js"), glue).unwrap();
+
+        generate_bootstrap_and_manifest(out, "sycamore", None).unwrap();
+
+        assert_eq!(fs::read(out.join("sycamore.js")).unwrap(), glue);
+        assert!(out.join("sycamore.bootstrap.js").is_file());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("sycamore-assets.json")).unwrap()).unwrap();
+        assert_eq!(manifest["bootstrap"], "/sycamore.bootstrap.js");
+        assert_eq!(manifest["js"], "/sycamore.js");
     }
 
     #[test]

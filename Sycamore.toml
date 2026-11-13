@@ -1,17 +1,16 @@
 # Optional project configuration for cargo-sycamore.
 # CLI flags override matching values here. Paths are relative to this file.
 [build]
-# Shared with CLI flags:
+# "spa" (default) generates index.html; "ssr" leaves HTML to your server app
+# and requires [build.server]. Both modes build the WASM client assets.
+mode = "spa"
+# Shared by client/server Cargo builds:
 # manifest-path = "Cargo.toml"
-# package = "my-app"
-# bin = "client"
-# example = "counter" # Select an example instead of a binary/library.
+# Public files only (HTML, JS, WASM, manifest, stylesheet and copied assets).
+# Never a location for the native backend executable.
 # out-dir = "dist"
 
-# Config-only options:
-features = []
-default-features = true
-# Copy files/directories into the output directory (paths relative to this file).
+# Copy files/directories into the public output directory (paths relative to this file).
 # assets = [
 #     "favicon.ico",
 #     "images",
@@ -19,15 +18,49 @@ default-features = true
 #     { from = "public", to = "." },
 # ]
 
+# Optional client build target. Fields: package, bin, example, features,
+# default-features. CLI --package/--bin/--example selectors override config.
+# [build.client]
+# package = "web"
+# bin = "client" # or example = "counter", but not both
+# features = ["hydrate"]
+# default-features = true
+
+# Optional native host server executable, compiled in a separate Cargo invocation
+# with its own package/bin/features. It follows the CLI --release setting.
+# [build.server]
+# package = "backend"
+# bin = "http"
+# features = ["http"]
+# default-features = true
+#
+# At runtime the serve supervisor supplies SYCAMORE_SERVER_ADDR,
+# SYCAMORE_PUBLIC_DIR, and SYCAMORE_ASSET_MANIFEST. The app must honor these
+# values; no framework integration crate is included yet.
+
 # `release` is deliberately CLI-only: use `cargo sycamore build --release`.
+# Every build emits <output_name>.bootstrap.js and sycamore-assets.json with
+# root-relative public URLs for bootstrap/js/wasm and, when enabled, stylesheet.
+# SPA generates an HTML shell; SSR leaves HTML (and any SSG/export) to the app.
 
 [serve]
+# Local development frontend port; restart serve to change it.
 # May be overridden with `cargo sycamore serve --port 9000`.
 port = 8080
-# Browser reload after successful builds; rebuilding remains enabled when false.
+# Browser reload after successful builds; rebuilding continues when false.
 autoreload = true
-# Serve index.html for missing routes; override with --spa or --spa=false.
-spa = false
+# SPA fallback for missing frontend routes; CLI override: --spa / --spa=false.
+# spa = false # default false; omit this in backend-only (serve-frontend=false) mode.
+# Defaults to true for SPA and false for SSR. SSR cannot serve a frontend.
+# serve-frontend = true
+# Required by serve whenever [build.server] is configured, even when the app is
+# accessed directly on another origin. Must be nonzero and differ from `port`.
+# backend-port = 9000
+# Forward these prefix paths to the backend before static serving/SPA fallback.
+# Prefixes match path-segment boundaries; [] by default.
+# forward-routes = ["/api", "/auth"]
+# With serve-frontend = false, all paths except /__sycamore/ dev endpoints are
+# forwarded. Explicit `spa` and nonempty `forward-routes` are rejected in backend-only mode.
 
 [tools.wasm-opt]
 # Optimize release builds; override with --wasm-opt=false (debug builds skip it).

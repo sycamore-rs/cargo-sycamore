@@ -20,10 +20,17 @@ use crate::{
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
-/// Build the application, returning the output directory actually used.
-pub fn build(options: &Options) -> Result<PathBuf> {
+/// Public results from a completed application build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildOutput {
+    pub directory: PathBuf,
+    pub server: Option<PathBuf>,
+}
+
+/// Build the client and, when configured, its native server executable.
+pub fn build_application(options: &Options) -> Result<BuildOutput> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    build_with(options, &cargo, |tool, version| {
+    build_application_with(options, &cargo, |tool, version| {
         let name = match tool {
             BuiltinTool::WasmBindgenCli => "wasm-bindgen-cli",
             BuiltinTool::WasmOpt => "wasm-opt",
@@ -38,10 +45,46 @@ pub fn build(options: &Options) -> Result<PathBuf> {
     })
 }
 
+/// Compatibility entry point: build the client and return its public directory.
+pub fn build(options: &Options) -> Result<PathBuf> {
+    Ok(build_application(options)?.directory)
+}
+
+fn build_application_with(
+    options: &Options,
+    cargo: &OsStr,
+    mut ensure_tool: impl FnMut(BuiltinTool, &str) -> Result<PathBuf>,
+) -> Result<BuildOutput> {
+    // Compile the backend first: a failed native build must not publish a new
+    // client generation over the currently served output.
+    let server = options
+        .server
+        .as_ref()
+        .map(|config| build_server(options, config, cargo))
+        .transpose()?;
+    let directory = build_client_with(
+        options,
+        cargo,
+        &mut ensure_tool,
+        options.mode == crate::options::BuildMode::Spa,
+    )?;
+    Ok(BuildOutput { directory, server })
+}
+
+#[cfg(test)]
 fn build_with(
     options: &Options,
     cargo: &OsStr,
     mut ensure_tool: impl FnMut(BuiltinTool, &str) -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    build_client_with(options, cargo, &mut ensure_tool, true)
+}
+
+fn build_client_with(
+    options: &Options,
+    cargo: &OsStr,
+    mut ensure_tool: impl FnMut(BuiltinTool, &str) -> Result<PathBuf>,
+    generate_shell: bool,
 ) -> Result<PathBuf> {
     let mut metadata_command = MetadataCommand::new();
     metadata_command.cargo_path(cargo).no_deps();
@@ -193,14 +236,158 @@ fn build_with(
     } else {
         None
     };
-    crate::html::generate_with_stylesheet(
-        project_root.as_std_path(),
-        &out_dir,
-        output_name,
-        stylesheet.as_deref(),
-    )?;
+    crate::html::generate_bootstrap_and_manifest(&out_dir, output_name, stylesheet.as_deref())?;
+    if generate_shell {
+        crate::html::generate_with_stylesheet(
+            project_root.as_std_path(),
+            &out_dir,
+            output_name,
+            stylesheet.as_deref(),
+        )?;
+    }
     eprintln!("Built {} → {}", package.name, out_dir.display());
     Ok(out_dir)
+}
+
+fn build_server(
+    options: &Options,
+    config: &crate::options::ServerOptions,
+    cargo: &OsStr,
+) -> Result<PathBuf> {
+    let mut metadata_command = MetadataCommand::new();
+    metadata_command.cargo_path(cargo).no_deps();
+    if let Some(manifest) = &options.manifest_path {
+        metadata_command.manifest_path(manifest);
+    }
+    let metadata = metadata_command
+        .exec()
+        .context("reading Cargo project metadata for server build")?;
+    // Server package/bin selection is independent from the client target, while
+    // an omitted server package follows the same package selection convention.
+    let package = select_package(
+        &metadata,
+        config.package.as_deref().or(options.package.as_deref()),
+    )?;
+    let target = select_server_target(package, config.bin.as_deref())?;
+    let host = rust_host()?;
+    let mut command = Command::new(cargo);
+    command
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&package.manifest_path)
+        .arg("--package")
+        .arg(package.name.as_str())
+        .arg("--target")
+        .arg(&host)
+        .arg("--bin")
+        .arg(&target.name)
+        .arg("--message-format=json-render-diagnostics");
+    if options.release {
+        command.arg("--release");
+    }
+    if !config.features.is_empty() {
+        command.arg("--features").arg(config.features.join(","));
+    }
+    if !config.default_features {
+        command.arg("--no-default-features");
+    }
+    eprintln!("Building server {} for {host}...", package.name);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("starting native server cargo build")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("capturing native cargo build output")?;
+    let mut executables = BTreeSet::new();
+    let mut parse_error = None;
+    for message in Message::parse_stream(BufReader::new(stdout)) {
+        match message {
+            Ok(Message::CompilerArtifact(artifact))
+                if artifact.package_id == package.id
+                    && artifact.target.name == target.name
+                    && artifact.target.is_bin() =>
+            {
+                if let Some(executable) = artifact.executable {
+                    executables.insert(executable.into_std_path_buf());
+                }
+            }
+            Ok(Message::TextLine(line)) => eprintln!("{line}"),
+            Err(error) => parse_error = Some(error),
+            _ => {}
+        }
+    }
+    let status = child.wait().context("waiting for native cargo build")?;
+    ensure!(status.success(), "native cargo build failed ({status})");
+    if let Some(error) = parse_error {
+        return Err(error).context("reading native cargo build messages");
+    }
+    ensure!(
+        executables.len() == 1,
+        "expected one executable for server binary '{}', found {}",
+        target.name,
+        executables.len()
+    );
+    let executable = executables
+        .into_iter()
+        .next()
+        .context("missing server executable")?;
+    ensure!(
+        executable.is_file(),
+        "Cargo reported server executable {} but it does not exist",
+        executable.display()
+    );
+    eprintln!("Built server {} → {}", package.name, executable.display());
+    Ok(executable)
+}
+
+fn select_server_target<'a>(package: &'a Package, bin: Option<&str>) -> Result<&'a Target> {
+    if let Some(bin) = bin {
+        let target = package
+            .targets
+            .iter()
+            .find(|target| target.name == bin)
+            .with_context(|| format!("package '{}' has no target named '{bin}'", package.name))?;
+        ensure!(
+            target.is_bin(),
+            "server target '{bin}' in package '{}' is not a binary target",
+            package.name
+        );
+        return Ok(target);
+    }
+    let bins: Vec<_> = package
+        .targets
+        .iter()
+        .filter(|target| target.is_bin())
+        .collect();
+    ensure!(
+        bins.len() == 1,
+        "package '{}' needs exactly one binary target for the server build; configure server.bin",
+        package.name
+    );
+    Ok(bins[0])
+}
+
+fn rust_host() -> Result<String> {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(&rustc).arg("-vV").output().with_context(|| {
+        format!(
+            "running {} -vV to detect the native host target",
+            Path::new(&rustc).display()
+        )
+    })?;
+    ensure!(
+        output.status.success(),
+        "rustc -vV failed ({})",
+        output.status
+    );
+    let version = String::from_utf8(output.stdout).context("rustc -vV output is not UTF-8")?;
+    version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(str::to_owned)
+        .context("rustc -vV did not report a host target")
 }
 
 /// Optimize the bindgen-generated module, not Cargo's input artifact. Publish
@@ -534,6 +721,42 @@ mod tests {
     }
 
     #[test]
+    fn server_target_must_be_an_unambiguous_binary() {
+        let temp = fixture();
+        let root = temp.path();
+        fs::write(root.join("src/lib.rs"), "pub fn app() {}\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "test-app"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[lib]
+name = "library"
+"#,
+        )
+        .unwrap();
+        let meta = metadata(root);
+        let package = select_package(&meta, None).unwrap();
+        assert!(select_server_target(package, Some("library")).is_err());
+        assert_eq!(
+            select_server_target(package, None).unwrap().name,
+            "test-app"
+        );
+
+        fs::create_dir(root.join("src/bin")).unwrap();
+        fs::write(root.join("src/bin/another.rs"), "fn main() {}\n").unwrap();
+        let meta = metadata(root);
+        let package = select_package(&meta, None).unwrap();
+        assert!(select_server_target(package, None).is_err());
+        assert_eq!(
+            select_server_target(package, Some("another")).unwrap().name,
+            "another"
+        );
+    }
+
+    #[test]
     fn selects_named_examples_without_changing_default_targets() {
         let temp = fixture();
         let root = temp.path();
@@ -654,6 +877,53 @@ mod tests {
             mock_cargo_target(root, fail, None)
         }
 
+        fn mock_application_cargo(root: &Path, native_fail: bool) -> PathBuf {
+            let meta = metadata(root);
+            let package = select_package(&meta, None).unwrap();
+            let client = select_target(package, None, None).unwrap();
+            let server = select_server_target(package, None).unwrap();
+            let client_wasm = root.join("custom-target/test_app.wasm");
+            let executable = root.join("custom-native/test-app");
+            fs::create_dir_all(client_wasm.parent().unwrap()).unwrap();
+            fs::write(&client_wasm, b"fake wasm").unwrap();
+            let client_artifact = serde_json::json!({
+                "reason":"compiler-artifact", "package_id":package.id,
+                "manifest_path":package.manifest_path, "target":client,
+                "profile":{"opt_level":"0", "debuginfo":0, "debug_assertions":true, "overflow_checks":true, "test":false},
+                "features":[], "filenames":[client_wasm], "executable":null, "fresh":false
+            });
+            let server_artifact = serde_json::json!({
+                "reason":"compiler-artifact", "package_id":package.id,
+                "manifest_path":package.manifest_path, "target":server,
+                "profile":{"opt_level":"0", "debuginfo":0, "debug_assertions":true, "overflow_checks":true, "test":false},
+                "features":[], "filenames":[executable], "executable":executable, "fresh":false
+            });
+            let real_cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let cargo = root.join("mock-application-cargo");
+            script(
+                &cargo,
+                &format!(
+                    r#"if [ "$1" = metadata ]; then exec {} "$@"; fi
+if [ "$1" = -vV ]; then printf 'host: x86_64-unknown-linux-gnu\n'; exit 0; fi
+printf '%s\n' "$*" >> {}
+if echo "$*" | grep -q wasm32-unknown-unknown; then printf wasm > {}; printf '%s\n' {}; else
+{}
+mkdir -p {}
+printf server > {}
+printf '%s\n' {}; fi"#,
+                    quote(real_cargo),
+                    quote(root.join("build-args")),
+                    quote(&client_wasm),
+                    quote(client_artifact.to_string()),
+                    if native_fail { "exit 1" } else { "true" },
+                    quote(executable.parent().unwrap()),
+                    quote(&executable),
+                    quote(server_artifact.to_string()),
+                ),
+            );
+            cargo
+        }
+
         fn mock_cargo_target(root: &Path, fail: bool, example: Option<&str>) -> PathBuf {
             let meta = metadata(root);
             let package = select_package(&meta, None).unwrap();
@@ -741,6 +1011,108 @@ mod tests {
         }
 
         #[test]
+        fn builds_ssr_client_and_native_server_with_independent_targets_and_features() {
+            let temp = fixture();
+            let root = temp.path();
+            let cargo = mock_application_cargo(root, false);
+            fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
+            let bindgen = root.join("wasm-bindgen");
+            script(
+                &bindgen,
+                r#"while [ "$#" -gt 0 ]; do case "$1" in --out-dir) shift; out=$1;; --out-name) shift; name=$1;; esac; shift; done
+printf js > "$out/$name.js"
+printf wasm > "$out/${name}_bg.wasm""#,
+            );
+            let out = root.join("dist");
+            fs::create_dir(&out).unwrap();
+            fs::write(out.join("index.html"), "user-owned index").unwrap();
+            let options = Options {
+                manifest_path: Some(root.join("Cargo.toml")),
+                mode: crate::options::BuildMode::Ssr,
+                features: vec!["frontend".into()],
+                default_features: true,
+                server: Some(crate::options::ServerOptions {
+                    package: None,
+                    bin: None,
+                    features: vec!["backend".into()],
+                    default_features: false,
+                }),
+                wasm_opt: false,
+                ..Default::default()
+            };
+            let output = build_application_with(&options, cargo.as_os_str(), |tool, _| {
+                assert!(matches!(tool, BuiltinTool::WasmBindgenCli));
+                Ok(bindgen.clone())
+            })
+            .unwrap();
+
+            assert_eq!(output.directory, out);
+            assert_eq!(
+                output.server.as_deref(),
+                Some(root.join("custom-native/test-app").as_path())
+            );
+            assert_eq!(
+                fs::read_to_string(output.directory.join("index.html")).unwrap(),
+                "user-owned index"
+            );
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &fs::read(output.directory.join("sycamore-assets.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["bootstrap"], "/test_app.bootstrap.js");
+            assert_eq!(manifest["js"], "/test_app.js");
+            assert_eq!(manifest["wasm"], "/test_app_bg.wasm");
+
+            let invocations = fs::read_to_string(root.join("build-args")).unwrap();
+            let calls: Vec<_> = invocations.lines().collect();
+            assert_eq!(calls.len(), 2);
+            assert!(calls[0].contains(&rust_host().unwrap()));
+            assert!(calls[0].contains("backend"));
+            assert!(calls[0].contains("--no-default-features"));
+            assert!(!calls[0].contains("frontend"));
+            assert!(calls[1].contains("wasm32-unknown-unknown"));
+            assert!(calls[1].contains("frontend"));
+            assert!(!calls[1].contains("backend"));
+            assert!(!calls[1].contains("--no-default-features"));
+        }
+
+        #[test]
+        fn native_build_failure_keeps_previous_client_output_untouched() {
+            let temp = fixture();
+            let root = temp.path();
+            let cargo = mock_application_cargo(root, true);
+            let out = root.join("dist");
+            fs::create_dir(&out).unwrap();
+            fs::write(out.join("index.html"), "previous HTML").unwrap();
+            fs::write(out.join("previous.txt"), "previous asset").unwrap();
+            let options = Options {
+                manifest_path: Some(root.join("Cargo.toml")),
+                mode: crate::options::BuildMode::Ssr,
+                server: Some(crate::options::ServerOptions {
+                    package: None,
+                    bin: None,
+                    features: Vec::new(),
+                    default_features: true,
+                }),
+                ..Default::default()
+            };
+            let error = build_application_with(&options, cargo.as_os_str(), |_, _| {
+                panic!("client tools must not be ensured after native build failure")
+            })
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("native cargo build failed"));
+            assert_eq!(
+                fs::read_to_string(out.join("index.html")).unwrap(),
+                "previous HTML"
+            );
+            assert_eq!(
+                fs::read_to_string(out.join("previous.txt")).unwrap(),
+                "previous asset"
+            );
+            assert_eq!(fs::read_dir(out).unwrap().count(), 2);
+        }
+
+        #[test]
         fn release_optimizes_bindgen_output_for_applications_and_examples() {
             for example in [false, true] {
                 let temp = fixture();
@@ -806,7 +1178,7 @@ mod tests {
                 assert!(out.join("index.html").exists());
                 assert_eq!(
                     fs::read_dir(out).unwrap().count(),
-                    2,
+                    4,
                     "temporary optimizer output must not remain"
                 );
             }

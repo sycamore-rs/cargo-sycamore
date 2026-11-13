@@ -21,21 +21,28 @@ cargo sycamore build --help
 Settings can also come from `Sycamore.toml` or `[package.metadata.sycamore]` in
 `Cargo.toml`; see [Configuration](#configuration).
 
-The build command:
+A build produces a browser client (WASM plus wasm-bindgen web bindings), the
+`<output_name>.bootstrap.js` bootstrap and `sycamore-assets.json` manifest, and—when
+configured—a separately compiled native server executable. Client and server are
+Cargo builds with independent target selection and feature sets. The default `[build].mode` is
+`spa`; it generates an `index.html` shell. `ssr` builds the same client assets and
+server executable but does not generate a tool-owned HTML shell. See
+[SPA and SSR builds](#spa-and-ssr-builds) for the architecture and examples.
 
-1. Selects a workspace package using Cargo's default members (or `--package`).
-2. Builds its `cdylib` library, or its sole binary, for `wasm32-unknown-unknown`.
-   Use `--bin` to explicitly select a binary when needed.
-3. Reads the exact `wasm-bindgen` dependency version from the workspace's
-   `Cargo.lock` **after** Cargo creates/updates it.
-4. Automatically downloads/caches that version of `wasm-bindgen-cli` and runs
-   it with `--target web` on the actual WASM artifact reported by Cargo.
-5. For release builds, downloads/caches Binaryen's `wasm-opt` and optimizes the
-   generated `*_bg.wasm` with `-Oz` before generating HTML or announcing success.
+The client build selects a workspace package using Cargo's default members (or
+`--package`), then builds its `cdylib` library or selected binary/example for
+`wasm32-unknown-unknown`. The exact `wasm-bindgen` dependency version is read from
+the workspace `Cargo.lock` after Cargo updates it; that version of
+`wasm-bindgen-cli` is downloaded/cached and run against the Cargo-reported artifact.
+Release builds also optimize generated `*_bg.wasm` with `wasm-opt` by default.
+When configured, Tailwind CSS runs as part of this client build.
 
-Generated HTML, JavaScript, and WASM go into the package's `dist/` directory by default.
-TypeScript declarations are disabled with wasm-bindgen's `--no-typescript` flag. An explicit `--out-dir` is relative to the current
-working directory. Custom Cargo target directories are supported.
+Public files, including HTML when generated, JavaScript, WASM, bootstrap, manifest,
+stylesheet and copied assets, go into `dist/` by default. This is the public asset
+directory, not a location for the backend executable; Cargo places the executable
+in its target directory. TypeScript declarations are disabled with
+wasm-bindgen's `--no-typescript` flag. An explicit `--out-dir` is relative to the
+current working directory. Custom Cargo target directories are supported.
 
 The app must depend (directly or transitively) on a released registry version of
 `wasm-bindgen`. Missing dependencies, multiple locked `wasm-bindgen` versions,
@@ -45,10 +52,12 @@ be unified, even if only one is used by the selected app.
 
 Debug builds download `wasm-bindgen-cli`; release builds also download
 `wasm-opt` unless disabled. When configured, Tailwind CSS is downloaded and run
-in either mode. The command generates an HTML entrypoint and WASM web bindings,
-and copies static files/directories listed in `[build].assets` (see below).
-Use `serve` for the development server. Existing files in the output directory
-are not cleaned. Set `GITHUB_TOKEN` if needed for GitHub API
+in either mode. The command generates browser bindings and public bootstrap/manifest
+assets; in SPA mode it also generates an HTML entrypoint. It copies static
+files/directories listed in `[build].assets` (see below). In SSR mode, HTML is
+app-owned and no build-time shell is generated. Use `serve` for the development
+server. Existing files in the output directory are not cleaned. Set `GITHUB_TOKEN`
+if needed for GitHub API
 rate limits; it is passed to the downloader for API requests only.
 
 ### Release WASM optimization
@@ -147,16 +156,18 @@ the source template is never modified. Remove any manually added Tailwind link
 from earlier setups to avoid duplicates. Keep input/source files outside generated
 output directories so watch can see edits.
 
-### HTML entrypoint
+### HTML entrypoint and public asset manifest
 
-Every successful build writes `index.html` into the output directory. If an
-`index.html` exists beside the selected package's `Cargo.toml`, it is used as the
-template; otherwise the bundled `templates/index.html` is used. In a workspace,
-this means the selected app package's root, not necessarily the workspace root.
+In the default SPA build mode, each successful build writes `index.html` into the
+public output directory. If an `index.html` exists beside the selected client
+package's `Cargo.toml`, it is used as the template; otherwise the bundled
+`templates/index.html` is used. In a workspace, this means the selected client
+package's root, not necessarily the workspace root. SSR mode deliberately skips
+this generated shell: the application server owns its HTML responses.
 
-The template is parsed as HTML5 using `scraper` (backed by `html5ever`), and a
-`<script type="module">` is appended to
-`<head>` to import the generated JavaScript and initialize WASM automatically:
+The SPA template is parsed as HTML5 using `scraper` (backed by `html5ever`), and a
+`<script type="module">` is appended to `<head>` to import the generated
+JavaScript and initialize WASM automatically:
 
 ```html
 <script type="module" data-cargo-sycamore>
@@ -171,10 +182,20 @@ are supplied by the parser, and user content/scripts are preserved (formatting
 may be normalized). A previous `script[data-cargo-sycamore]` is replaced rather
 than duplicated; that marker is reserved for generated startup scripts.
 
-The source template is never overwritten. Choosing an output path that would
-overwrite it produces an error. Changes to the app's `index.html`, including its
-creation or deletion, trigger regeneration in watch mode. Serve the output using
-an HTTP server rather than opening it as a `file://` URL.
+Every build mode also writes `<output_name>.bootstrap.js` and
+`sycamore-assets.json` to the public output directory. The manifest contains the
+fields `bootstrap`, `js`, and `wasm`, plus `stylesheet` when Tailwind CSS is enabled.
+Values are root-relative public URLs (for example, `/my_app.bootstrap.js`,
+`/my_app.js`, `/my_app_bg.wasm`, and optionally `/index.css`), never filesystem
+paths. The `bootstrap` value points to the generated bootstrap filename, which is
+derived from the client artifact name to avoid colliding with wasm-bindgen output.
+The bootstrap imports the client JS and initializes WASM. SSR applications can
+read this manifest to emit their own HTML and asset links.
+
+The SPA source template is never overwritten. Choosing an output path that would
+overwrite it produces an error. Changes to the client package's `index.html`,
+including its creation or deletion, trigger regeneration in watch mode. Serve
+browser output using HTTP rather than opening it as a `file://` URL.
 
 ### Running Cargo examples
 
@@ -191,12 +212,12 @@ Examples are selected by Cargo target name: `examples/counter.rs`,
 `examples/counter/main.rs`, or a custom `[[example]]` target in `Cargo.toml`.
 Binary and `cdylib` examples are supported; Rust-only library example crate types
 cannot produce the required WASM executable. Example dev-dependencies are handled
-by Cargo, and required features can be enabled with `[build].features`.
+by Cargo, and required features can be enabled with `[build.client].features`.
 
 You can also select an example in `Sycamore.toml`:
 
 ```toml
-[build]
+[build.client]
 example = "counter"
 ```
 
@@ -206,9 +227,9 @@ An explicit CLI target selector overrides the configured target selector, so
 a configured `example`. Without an example selection, normal library/binary target
 selection is unchanged.
 
-Examples use the same package-root `index.html` template and default package
-`dist/` output as normal builds. Use `--out-dir` to keep separate outputs when
-switching targets. `serve --example` includes watching and browser autoreload
+SPA examples use the same package-root `index.html` template and default package
+`dist/` output as normal builds; SSR examples do not generate a shell. Use
+`--out-dir` to keep separate outputs when switching targets. `serve --example` includes watching and browser autoreload
 according to your usual serve settings.
 
 ## Watching for changes
@@ -249,8 +270,8 @@ The active `Sycamore.toml` is watched even when outside the workspace. Options a
 resolved again on each rebuild, so config changes take effect without restarting;
 invalid config is reported while watching continues. Watch roots and output
 exclusions are updated when valid configuration changes the project or output
-path. Local dependencies outside the workspace and other external assets are not
-watched. Native filesystem watcher errors are fatal rather than silently missing
+path. Configured assets and Tailwind inputs outside the workspace are watched;
+other local dependencies outside the workspace are not watched. Native filesystem watcher errors are fatal rather than silently missing
 future edits.
 
 ## Development server
@@ -262,77 +283,135 @@ cargo sycamore s --port 9000 # shorthand for serve
 cargo sycamore serve --release --package my-app --out-dir public
 ```
 
-`serve` binds to **http://127.0.0.1:8080** by default and serves the selected app's
-`dist/` directory (or the output directory configured via CLI/TOML). It starts the
-same initial build and file watcher as `watch`, including automatic tool downloads,
-change logging, debounce, config reloads, and recovery from compilation errors.
-Requests return 404 until output exists; after a build failure, any existing output
-remains available. Connected browsers automatically reload after successful builds;
-failed builds do not trigger a reload. Stop the server and watcher with **Ctrl-C**.
+`serve` binds to **http://127.0.0.1:8080** by default and runs the selected build
+and watcher. In SPA mode it serves the public asset directory and can proxy chosen
+routes to a separately built native application server. In SSR mode it runs the
+native server and proxies application requests; it does not serve a frontend. The
+build output directory (`dist/` by default) contains public assets only, never the
+backend executable. Build and watch do not need development-server ports; `serve`
+requires `[serve].backend-port` whenever `[build.server]` is configured, even if
+the application is reached directly on a separate origin.
 
-Configure the port in `Sycamore.toml`:
+A configured backend must honor the runtime contract supplied by the supervisor:
+`SYCAMORE_SERVER_ADDR` is its loopback listen address,
+`SYCAMORE_PUBLIC_DIR` is the snapshot of public assets, and
+`SYCAMORE_ASSET_MANIFEST` is the path to `sycamore-assets.json` in that snapshot.
+The backend must bind the supplied address and use the public directory/manifest
+as appropriate. No framework integration crate is included yet. The tool does not
+prescribe production deployment topology; static generation/export is
+application-owned.
+
+For a typical SPA with selected backend routes proxied by the same-origin dev
+server:
 
 ```toml
+[build]
+mode = "spa"
+
+[build.client]
+package = "web"
+features = ["csr"]
+
+[build.server]
+package = "backend"
+bin = "http"
+features = ["http"]
+
 [serve]
-port = 9000
-autoreload = true
-spa = false
+port = 8080
+backend-port = 9000
+forward-routes = ["/api", "/auth"]
 ```
 
-Autoreload defaults to `true`. Set `[serve].autoreload = false` to disable browser
-reloads while continuing to watch and rebuild. Override either config value with
-`--autoreload` (enable), `--autoreload=true`, or `--autoreload=false` (disable).
-Like the port, this setting takes effect when `serve` starts; restart after changing it.
-When disabled, HTML is served without a reload client and the reload endpoints are
-not registered.
+The frontend serves missing GET/HEAD paths with `index.html` when
+`[serve].spa = true`; configured forwarded routes are handled by the backend
+first. Prefixes match complete path segments (`/api` matches `/api` and
+`/api/users`, but not `/apiary`). `forward-routes` defaults to `[]`.
 
-Set `[serve].spa = true` for single-page applications with client-side routing.
-Missing GET/HEAD paths fall back to the output directory's `index.html` with a 200
-HTML response. Existing files and directory indexes still take precedence; unsafe
-paths and reserved `/__sycamore/` endpoints do not fall back. If `index.html` is
-missing, the response remains 404. The fallback also applies to asset-like paths
-that are missing, not just extensionless routes.
+For SSR, build the client assets and backend independently but run the same
+supervised backend in `serve`; it owns all HTML and static asset responses:
 
-For nested routes, fallback HTML gets `<base href="/">` unless the template already
-has a `<base href>`; this keeps relative JS/WASM and asset URLs rooted correctly.
-Only the HTTP response is modified, never the source template or files on disk.
-SPA fallback works with or without autoreload and defaults to `false`. Use `--spa`
-(or `--spa=true`) to enable it, or `--spa=false` to override an enabled config
-setting. CLI values take precedence; an omitted flag preserves the config value.
-The setting takes effect at server startup (restart after changing it).
+```toml
+[build]
+mode = "ssr"
 
-`--port` overrides `[serve].port`; otherwise the default is 8080. The port is fixed
-at startup, so restart `serve` after changing it. Port 0 asks the OS for a free
-port, which is printed at startup. All regular build flags are supported too.
-Successful rebuilds update the served directory if build configuration changes it.
+[build.client]
+package = "web"
+features = ["hydrate"]
 
-The Axum server supports GET/HEAD, directory `index.html`, byte ranges for static
-assets, and MIME types including `application/wasm`. Responses disable caching for
-development. Traversal and symlinks pointing outside the output directory are rejected.
-Host headers are restricted to the local server, and WebSocket connections must
-have a matching same-origin browser Origin header.
+[build.server]
+package = "backend"
+bin = "http"
+features = ["ssr", "http"]
 
-The reload client is injected into **served HTML responses only**—normal build
-output and source templates never contain development-server code. The reserved
-paths `/__sycamore/reload.js` and `/__sycamore/reload` provide the client module
-and WebSocket endpoint. The client reconnects after disconnections and reloads
-when the server restarts or a successful build was missed while disconnected.
-Each served page carries its build version to catch rebuilds between loading the
-HTML and connecting the socket. All connected tabs reload only after the complete
-successful build, including HTML generation, finishes.
+[serve]
+backend-port = 9000
+# serve-frontend defaults to false in SSR mode.
+```
 
-While rebuilding, a small bottom-of-page pill warns that the page may be stale.
-If compilation or configuration fails, it becomes a red error pill and points you
-to the terminal; failed builds never reload the page. New connections receive the
-current status too. The indicator uses isolated Shadow DOM styles, doesn't move
-page content or capture pointer events, and respects reduced-motion preferences.
-All indicator UI lives in `src/reload.js` and is absent when autoreload is disabled.
+`serve-frontend = true` is invalid in SSR mode. With `serve-frontend = false`,
+all application requests go to the backend except reserved `/__sycamore/`
+development endpoints; explicit `spa` and nonempty `forward-routes` are rejected
+in this backend-only mode. The backend port must be nonzero and different from
+the public port. A configured server always requires `backend-port` for `serve`,
+whether or not frontend traffic is proxied.
 
-If your custom HTML has a Content Security Policy, allow the same-origin client
-script, local WebSocket connections, and the indicator's inline styles during
-development. There is no directory listing; SPA-route fallback is opt-in via
-`[serve].spa`. This is a **local development server**, not a
-production server; it deliberately listens only on loopback.
+Set `[serve].serve-frontend = true` to serve the frontend in SPA mode (the default
+there); it defaults to `false` in SSR mode. `[serve].forward-routes` selects
+backend prefixes when the frontend is served and requires `[build.server]`.
+Forwarding occurs before static file lookup and SPA fallback. When frontend
+serving is disabled, all routes except the reserved `/__sycamore/` development
+endpoints go to the backend. `spa` and
+nonempty `forward-routes` are rejected with frontend serving disabled.
+The public `port` defaults to 8080 (`0` asks the OS for a free port, printed at
+startup); `backend-port` is required with a configured server, must be nonzero,
+and must differ from the public port. Public port changes require restarting
+`serve`.
+
+Autoreload defaults to `true`; `[serve].autoreload = false` disables browser
+reloads while watching and rebuilding continues. Override with `--autoreload`,
+`--autoreload=true`, or `--autoreload=false`. `[serve].spa` defaults to `false`
+(and `--spa` / `--spa=false` overrides it). SPA fallback handles missing GET/HEAD
+paths via public `index.html`, after route forwarding, and adds `<base href="/">`
+to the response if needed. Existing files and directory indexes take precedence;
+reserved endpoints do not fall back. These settings and `serve-frontend`,
+`backend-port`, and `forward-routes` can be reloaded when configuration changes.
+Build/watch do not require these runtime ports, but serve validation applies them.
+
+The development supervisor snapshots the backend executable and public assets,
+waits for TCP readiness, and restores the previous backend generation if a restart
+fails. It manages and kills only the direct child process; backend grandchildren
+are not supported. Public assets are also published as successful frontend
+snapshots. Compilation/configuration failures preserve the last good served output.
+
+The dev proxy supports streaming HTTP and application WebSockets. Application
+response statuses and headers are preserved, except hop-by-hop headers; with
+autoreload, eligible HTML responses have reload metadata adjusted as described
+below. It requests identity encoding for reload injection. Only an identity,
+`text/html`, status-200 response gets the reload module appended at the end of the
+stream; content length and validators are removed. Compressed HTML is passed through
+untouched. A Content Security Policy may block the injected development script.
+
+The Axum frontend supports GET/HEAD, directory `index.html`, byte ranges for static
+assets, and MIME types including `application/wasm`. Traversal and symlinks outside
+the public output are rejected. The server is local-development infrastructure,
+not a production server, and listens only on loopback. Host headers are restricted
+to the local server, and reload WebSocket connections require a matching
+same-origin browser Origin header. Application WebSocket authorization remains
+the backend's responsibility.
+
+The backend's loopback port is also directly reachable; the proxy's Host/Origin
+guards do not protect that port. The application must apply appropriate Host,
+Origin, CORS, and authentication checks, especially for state-changing endpoints.
+Loopback binding alone is not protection against requests from untrusted websites.
+
+The reload endpoints are `/__sycamore/reload.js` and `/__sycamore/reload`. The
+client reconnects after disconnections and reloads after successful builds or
+server restarts. A page carries its build version to detect missed rebuilds. All
+tabs reload only after a complete successful build; failed builds never reload the
+page. A status pill reports builds and errors. Its UI lives in `src/reload.js` and
+is absent when autoreload is disabled. A custom CSP may need to allow the
+same-origin module, local WebSocket connection, and indicator inline styles.
 
 ## Configuration
 
@@ -340,31 +419,74 @@ Create a `Sycamore.toml` in your project (a commented template is included here)
 
 ```toml
 [build]
-# May also be supplied as CLI flags:
+mode = "spa" # default; use "ssr" for server-rendered HTML
 manifest-path = "Cargo.toml"
-package = "my-app"
-# bin = "client"
-out-dir = "dist"
+out-dir = "dist" # public assets only, not the backend executable
+# assets = ["favicon.ico", "images"] # optional files/directories to copy
 
-# Config only; these are not CLI flags:
-features = ["csr"]
+[build.client]
+package = "web"
+# bin = "client" # or example = "counter"
+features = ["hydrate"]
 default-features = true
+
+# Optional native host executable; built separately from the client.
+[build.server]
+package = "backend"
+bin = "http"
+features = ["http"]
+default-features = true
+
+[serve]
+port = 8080
+autoreload = true
+serve-frontend = true # defaults to true for SPA, false for SSR
+backend-port = 9000 # required by serve whenever [build.server] exists
+forward-routes = ["/api"] # optional; default []
+spa = false
 ```
 
 The precedence is **explicit CLI flags → configuration → built-in defaults**.
 For example, `cargo sycamore b --out-dir public --release` overrides the configured
-output directory and selects the release profile.
+output directory and selects the release profile. Client selectors and feature
+settings are configured under `[build.client]`; client CLI target selectors
+override configured target selectors. The client and server package/feature
+settings are otherwise independent.
 
-| Option | CLI | `Sycamore.toml` (`[build]`) | Default |
+### SPA and SSR builds
+
+`[build].mode` is `"spa"` by default or `"ssr"`. SSR mode requires
+`[build.server]`. `[build.client]` accepts optional `package`, `bin`, `example`,
+`features`, and `default-features`. `[build.server]` accepts optional `package`,
+`bin`, `features`, and `default-features`; its binary is compiled for the native
+host in a separate Cargo invocation, not into the public output directory. Both
+feature sets default to `[]` and default features to `true`; the server uses the
+same `--release` selection as the client.
+
+The shared `[build]` keys `manifest-path`, `out-dir`, and `assets` remain shared.
+The `out-dir` is always the public asset directory. All modes emit
+`<output_name>.bootstrap.js` and `sycamore-assets.json`; SPA also generates the
+HTML shell, while SSR leaves HTML generation to the application. Static site
+generation/export is not performed by the tool.
+
+`[serve]` keys are `port` (8080), `autoreload` (`true`), `spa` (`false`),
+`serve-frontend` (defaults by build mode), `backend-port` (required at serve time
+when `[build.server]` exists), and `forward-routes` (`[]`). The backend port must
+be nonzero and differ from the public port. See
+[Development server](#development-server) for routing and runtime details.
+
+| Option | CLI | `Sycamore.toml` config key | Default |
 | --- | --- | --- | --- |
-| Manifest | `--manifest-path` | `manifest-path` | Cargo's current project |
-| Package | `--package` / `-p` | `package` | Cargo's default members |
-| Binary | `--bin` | `bin` | cdylib or sole binary |
-| Example | `--example` | `example` | none |
-| Output | `--out-dir` | `out-dir` | `<package>/dist` |
-| Static assets | — | `assets` | `[]` |
-| Features | — | `features` | `[]` |
-| Default features | — | `default-features` | `true` |
+| Manifest | `--manifest-path` | `build.manifest-path` | Cargo's current project |
+| Client package | `--package` / `-p` | `build.client.package` | Cargo's default members |
+| Client binary | `--bin` | `build.client.bin` | cdylib or sole binary |
+| Client example | `--example` | `build.client.example` | none |
+| Output | `--out-dir` | `build.out-dir` | `<package>/dist` (public assets) |
+| Static assets | — | `build.assets` | `[]` |
+| Client features | — | `build.client.features` | `[]` |
+| Client default features | — | `build.client.default-features` | `true` |
+| Build mode | — | `build.mode` | `spa` |
+| Native server | — | `build.server` | not built |
 | Release profile | `--release` | — | debug |
 | Config file | `--config` | — | nearest config source |
 
@@ -407,17 +529,26 @@ WASM optimization settings live under `[tools.wasm-opt]`:
 The old `[build].wasm-opt` and `[build].wasm-opt-version` keys are no longer
 accepted; move them to this tools section.
 
-Server settings live under `[serve]`: `port` corresponds to the serve-only
-`--port` flag and defaults to 8080. `autoreload` corresponds to `--autoreload` and
-defaults to `true`. Both CLI overrides preserve config values when omitted.
-`spa` corresponds to the serve-only `--spa` flag and defaults to `false`.
+Serve-only flags remain unchanged: `--port` overrides `[serve].port` and
+`--autoreload` overrides `[serve].autoreload`; `--spa` / `--spa=false` overrides
+`[serve].spa`. `serve-frontend`, `backend-port`, and `forward-routes` are
+configuration-only. Build and watch ignore serving ports; serve validates them.
 
 Alternatively, use the same schema inside the package's `Cargo.toml`:
 
 ```toml
 [package.metadata.sycamore.build]
-out-dir = "dist"
-features = ["csr"]
+mode = "ssr"
+out-dir = "public"
+
+[package.metadata.sycamore.build.client]
+package = "web"
+features = ["hydrate"]
+
+[package.metadata.sycamore.build.server]
+package = "backend"
+bin = "http"
+features = ["ssr"]
 
 [package.metadata.sycamore.tools.wasm-opt]
 enable = true
@@ -425,7 +556,8 @@ version = "133"
 
 [package.metadata.sycamore.serve]
 port = 8080
-spa = true
+backend-port = 9000
+# serve-frontend defaults to false for SSR.
 ```
 
 The `build`, `serve`, and `tools` tables are nested under `package.metadata.sycamore`;

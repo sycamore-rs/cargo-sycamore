@@ -1,6 +1,6 @@
 # cargo-sycamore
 
-A Cargo subcommand for building and locally developing [Sycamore](https://sycamore.dev) applications with WebAssembly.
+A Cargo subcommand for building and locally developing [Sycamore](https://sycamore.dev) applications with WebAssembly and optional native SPA/SSR backends.
 
 ## Install locally
 
