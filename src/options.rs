@@ -339,9 +339,9 @@ impl Options {
         if !tailwind.enable
             && (tailwind.input.is_some() || tailwind.output.is_some() || tailwind.version.is_some())
         {
-            eprintln!(
-                "warning: tools.tailwindcss options are set but enable = false; Tailwind CSS is disabled and these options are ignored. Set tools.tailwindcss.enable = true to enable it."
-            );
+            crate::logging::warn(format_args!(
+                "tools.tailwindcss options are set but enable = false; Tailwind CSS is disabled and these options are ignored. Set tools.tailwindcss.enable = true to enable it."
+            ));
         }
         let tailwindcss = if tailwind.enable {
             Some(TailwindOptions {
@@ -606,12 +606,12 @@ fn warn_duplicate_config(path: &Path) {
     // This source is ignored, so even malformed metadata must not invalidate
     // the selected standalone file. Read only enough to detect its presence.
     if matches!(manifest_metadata(&manifest), Ok(Some(_))) {
-        eprintln!(
-            "warning: found both {} and [package.metadata.sycamore] in {}; using {} and ignoring Cargo metadata (configuration sources are not merged)",
+        crate::logging::warn(format_args!(
+            "found both {} and [package.metadata.sycamore] in {}; using {} and ignoring Cargo metadata (configuration sources are not merged)",
             path.display(),
             manifest.display(),
             path.display()
-        );
+        ));
     }
 }
 

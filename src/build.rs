@@ -37,7 +37,7 @@ pub fn build_application(options: &Options) -> Result<BuildOutput> {
             BuiltinTool::WasmOpt => "wasm-opt",
             BuiltinTool::TailwindCss => "tailwindcss",
         };
-        eprintln!("Ensuring {name} {version} is available...");
+        crate::logging::debug(format_args!("Ensuring {name} {version} is available..."));
         let mut cache = ToolCache::system()?;
         if let Ok(token) = std::env::var("GITHUB_TOKEN") {
             cache = cache.with_github_token(token);
@@ -126,7 +126,10 @@ fn build_client_with(
     if !options.default_features {
         command.arg("--no-default-features");
     }
-    eprintln!("Building {} for {WASM_TARGET}...", package.name);
+    crate::logging::status(
+        "Building",
+        format_args!("{} for {WASM_TARGET}...", package.name),
+    );
     let mut child = command
         .stdout(Stdio::piped())
         .spawn()
@@ -150,7 +153,7 @@ fn build_client_with(
                     }
                 }
             }
-            Ok(Message::TextLine(line)) => eprintln!("{line}"),
+            Ok(Message::TextLine(line)) => crate::logging::raw(format_args!("{line}")),
             Err(error) => parse_error = Some(error),
             _ => {}
         }
@@ -211,6 +214,10 @@ fn build_client_with(
         .file_stem()
         .and_then(|name| name.to_str())
         .context("WASM artifact has no UTF-8 filename")?;
+    crate::logging::status(
+        "Generating",
+        format_args!("web bindings for {}", package.name),
+    );
     let status = Command::new(&bindgen)
         .arg(&wasm)
         .arg("--target")
@@ -257,8 +264,15 @@ fn build_client_with(
             &options.public_url,
         )?;
     }
+    crate::logging::debug(format_args!(
+        "Publishing staged build to {}",
+        directory.display()
+    ));
     publish_staging(&directory, &staging)?;
-    eprintln!("Built {} → {}", package.name, directory.display());
+    crate::logging::status(
+        "Finished",
+        format_args!("{} → {}", package.name, directory.display()),
+    );
     Ok(directory)
 }
 
@@ -349,7 +363,9 @@ fn publish_staging(directory: &Path, staging: &Path) -> Result<()> {
     )
     .context("publishing staged build output")?;
     if let Err(error) = remove_output_entry(staging) {
-        eprintln!("warning: published output but could not remove staging: {error:#}");
+        crate::logging::warn(format_args!(
+            "published output but could not remove staging: {error:#}"
+        ));
     }
     Ok(())
 }
@@ -411,7 +427,10 @@ fn build_server(
     if !config.default_features {
         command.arg("--no-default-features");
     }
-    eprintln!("Building server {} for {host}...", package.name);
+    crate::logging::status(
+        "Building",
+        format_args!("server {} for {host}...", package.name),
+    );
     let mut child = command
         .stdout(Stdio::piped())
         .spawn()
@@ -433,7 +452,7 @@ fn build_server(
                     executables.insert(executable.into_std_path_buf());
                 }
             }
-            Ok(Message::TextLine(line)) => eprintln!("{line}"),
+            Ok(Message::TextLine(line)) => crate::logging::raw(format_args!("{line}")),
             Err(error) => parse_error = Some(error),
             _ => {}
         }
@@ -458,7 +477,10 @@ fn build_server(
         "Cargo reported server executable {} but it does not exist",
         executable.display()
     );
-    eprintln!("Built server {} → {}", package.name, executable.display());
+    crate::logging::status(
+        "Finished",
+        format_args!("server {} → {}", package.name, executable.display()),
+    );
     Ok(executable)
 }
 
@@ -520,7 +542,10 @@ fn optimize_wasm(wasm: &Path, optimizer: &Path) -> Result<()> {
         .suffix(".wasm")
         .tempfile_in(wasm.parent().context("WASM output has no parent")?)
         .context("creating temporary wasm-opt output")?;
-    eprintln!("Optimizing {} with wasm-opt (-Oz)...", wasm.display());
+    crate::logging::status(
+        "Optimizing",
+        format_args!("{} with wasm-opt (-Oz)...", wasm.display()),
+    );
     let status = Command::new(optimizer)
         .arg(wasm)
         .arg("-Oz")
@@ -582,10 +607,13 @@ fn compile_tailwind(
     if release {
         command.arg("--minify");
     }
-    eprintln!(
-        "Building Tailwind CSS {} → {}...",
-        config.input.display(),
-        output.display()
+    crate::logging::status(
+        "Compiling",
+        format_args!(
+            "Tailwind CSS {} → {}...",
+            config.input.display(),
+            output.display()
+        ),
     );
     let status = command
         .status()

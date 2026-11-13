@@ -71,14 +71,17 @@ async fn serve_async(args: ServeArgs, options: Options, directory: PathBuf) -> R
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_watch = Arc::clone(&shutdown);
     let app = router(Arc::clone(&state));
-    eprintln!(
-        "Serving {} at http://{address}{} (Ctrl-C to stop)",
-        state
-            .root
-            .read()
-            .map_err(|_| anyhow!("server directory lock poisoned"))?
-            .display(),
-        options.public_url
+    crate::logging::status(
+        "Serving",
+        format_args!(
+            "{} at http://{address}{} (Ctrl-C to stop)",
+            state
+                .root
+                .read()
+                .map_err(|_| anyhow!("server directory lock poisoned"))?
+                .display(),
+            options.public_url
+        ),
     );
 
     let (sender, stopped) = oneshot::channel();
@@ -107,7 +110,9 @@ async fn serve_async(args: ServeArgs, options: Options, directory: PathBuf) -> R
                         "backend-port must differ from the public development port"
                     );
                     if options.port != state.port && options.port != 0 {
-                        eprintln!("warning: restart serve to change the public port");
+                        crate::logging::warn(format_args!(
+                            "restart serve to change the public port"
+                        ));
                     }
                     let generation = snapshot_frontend(&output.directory.join("public"))?;
                     if let Some(executable) = &output.server {
@@ -138,7 +143,8 @@ async fn serve_async(args: ServeArgs, options: Options, directory: PathBuf) -> R
             if let Ok(mut backend) = backend_monitor.try_lock()
                 && let Err(error) = backend.check()
             {
-                eprintln!("error: {error:#}\nWaiting for changes...");
+                crate::logging::error(format_args!("{error:#}"));
+                crate::logging::status("Waiting", format_args!("for changes..."));
                 monitoring_state.set_phase(BuildPhase::Failed);
             }
         }
@@ -321,7 +327,10 @@ impl ServerState {
             .map_err(|_| anyhow!("server directory lock poisoned"))?;
         if *root != directory {
             *root = directory.to_owned();
-            eprintln!("Serving updated output directory: {}", root.display());
+            crate::logging::debug(format_args!(
+                "serving updated output directory: {}",
+                root.display()
+            ));
         }
         // Called only after a successful build, including HTML generation.
         // Keep this under the root lock so HTTP snapshots see matching versions.
@@ -585,7 +594,7 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
         let html = match html {
             Ok(html) => html,
             Err(error) => {
-                eprintln!("error: preparing served HTML: {error:#}");
+                crate::logging::error(format_args!("preparing served HTML: {error:#}"));
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };

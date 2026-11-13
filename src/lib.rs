@@ -4,6 +4,7 @@ pub mod assets;
 mod backend;
 pub mod build;
 pub mod html;
+pub mod logging;
 pub mod options;
 mod proxy;
 pub mod serve;

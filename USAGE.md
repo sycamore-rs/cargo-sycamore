@@ -1,5 +1,23 @@
 # Usage
 
+## CLI output
+
+Tool diagnostics use Cargo-style status labels on stderr, without timestamps,
+module names, or spans. Color is enabled only for a compatible terminal and is
+disabled when stderr is redirected or `NO_COLOR` is set.
+
+```sh
+cargo sycamore build -v     # Include additional debug diagnostics.
+cargo sycamore serve -q     # Hide tool status messages.
+NO_COLOR=1 cargo sycamore build
+```
+
+`-v` / `--verbose` and `-q` / `--quiet` are global flags and can appear before or
+after the subcommand; they cannot be combined. Quiet mode still shows warnings
+and errors. Cargo/compiler text and child-process stdout/stderr are not filtered
+or reformatted by these flags. Command output and clap help remain separate from
+tool diagnostics.
+
 ## Building an application
 
 Install the Rust WASM target once, then run from your app's directory:

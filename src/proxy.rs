@@ -86,7 +86,7 @@ pub(crate) async fn forward(
     match forward_http(request, port, reload_version).await {
         Ok(response) => response,
         Err(error) => {
-            eprintln!("error: forwarding request to backend: {error}");
+            crate::logging::error(format_args!("forwarding request to backend: {error}"));
             (StatusCode::BAD_GATEWAY, "Backend is unavailable").into_response()
         }
     }

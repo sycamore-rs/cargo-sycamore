@@ -93,14 +93,19 @@ pub(crate) fn watch_with_resolver(
     })
     .context("creating filesystem watcher")?;
     set_watches(&mut watcher, &[], &plan.roots)?;
-    eprintln!("Watching {} (Ctrl-C to stop)", plan.workspace.display());
+    crate::logging::status(
+        "Watching",
+        format_args!("{} (Ctrl-C to stop)", plan.workspace.display()),
+    );
     // Install watches before building so edits during a build aren't lost.
     on_event(BuildEvent::Started)?;
     report_build(&options, &mut on_event)?;
     loop {
         let changed = wait_for_change(&receiver, &plan, DEBOUNCE)?;
         if changed.is_empty() {
-            eprintln!("Filesystem rescan requested; checking for changes...");
+            crate::logging::debug(format_args!(
+                "filesystem rescan requested; checking for changes..."
+            ));
         } else {
             let paths = changed
                 .iter()
@@ -112,7 +117,7 @@ pub(crate) fn watch_with_resolver(
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            eprintln!("Changed: {paths}");
+            crate::logging::status("Changed", format_args!("{paths}"));
         }
         on_event(BuildEvent::Started)?;
         // Reload file configuration on every rebuild, including changes to the
@@ -125,11 +130,12 @@ pub(crate) fn watch_with_resolver(
             Ok((options, next)) => {
                 set_watches(&mut watcher, &plan.roots, &next.roots)?;
                 plan = next;
-                eprintln!("Change detected; rebuilding...");
+                crate::logging::status("Rebuilding", format_args!("after changes..."));
                 report_build(&options, &mut on_event)?;
             }
             Err(error) => {
-                eprintln!("error: {error:#}\nWaiting for changes...");
+                crate::logging::error(format_args!("{error:#}"));
+                crate::logging::status("Waiting", format_args!("for changes..."));
                 on_event(BuildEvent::Failed)?;
             }
         }
@@ -146,13 +152,15 @@ fn report_build(
                 output: &output,
                 options,
             }) {
-                eprintln!("error: publishing build: {error:#}\nWaiting for changes...");
+                crate::logging::error(format_args!("publishing build: {error:#}"));
+                crate::logging::status("Waiting", format_args!("for changes..."));
                 on_event(BuildEvent::Failed)?;
             }
             Ok(())
         }
         Err(error) => {
-            eprintln!("error: {error:#}\nWaiting for changes...");
+            crate::logging::error(format_args!("{error:#}"));
+            crate::logging::status("Waiting", format_args!("for changes..."));
             on_event(BuildEvent::Failed)
         }
     }

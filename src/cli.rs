@@ -6,6 +6,12 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "cargo sycamore", bin_name = "cargo sycamore", version, about)]
 pub struct Cli {
+    /// Show additional tool diagnostics.
+    #[arg(short, long, global = true, conflicts_with = "quiet")]
+    pub verbose: bool,
+    /// Hide tool status messages (warnings, errors, and compiler output remain).
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    pub quiet: bool,
     #[command(subcommand)]
     pub command: Command,
 }
