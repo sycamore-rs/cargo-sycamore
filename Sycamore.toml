@@ -6,16 +6,18 @@
 mode = "spa"
 # Shared by client/server Cargo builds:
 # manifest-path = "Cargo.toml"
-# Public files only (HTML, JS, WASM, manifest, stylesheet and copied assets).
+# Build root (default dist); browser-facing files go in <out-dir>/public/,
+# while sycamore-assets.json lives beside public/ at the build root.
 # Never a location for the native backend executable.
 # out-dir = "dist"
 
-# Copy files/directories into the public output directory (paths relative to this file).
+# Copy files/directories into <out-dir>/public/ (paths relative to this file).
+# Asset destinations (`to`) are relative to public/, not the build root.
 # assets = [
 #     "favicon.ico",
 #     "images",
 #     { from = "logo.svg", to = "img/brand.svg" },
-#     { from = "public", to = "." },
+#     { from = "public", to = "." }, # copies source contents to <out-dir>/public/
 # ]
 
 # Optional client build target. Fields: package, bin, example, features,
@@ -35,12 +37,15 @@ mode = "spa"
 # default-features = true
 #
 # At runtime the serve supervisor supplies SYCAMORE_SERVER_ADDR,
-# SYCAMORE_PUBLIC_DIR, and SYCAMORE_ASSET_MANIFEST. The app must honor these
-# values; no framework integration crate is included yet.
+# SYCAMORE_PUBLIC_DIR=<snapshot>/public, and
+# SYCAMORE_ASSET_MANIFEST=<snapshot>/sycamore-assets.json. Backend snapshots
+# contain the manifest sibling to public/. The app must honor these values;
+# no framework integration crate is included yet.
 
 # `release` is deliberately CLI-only: use `cargo sycamore build --release`.
-# Every build emits <output_name>.bootstrap.js and sycamore-assets.json with
-# root-relative public URLs for bootstrap/js/wasm and, when enabled, stylesheet.
+# Every build emits <output_name>.bootstrap.js under <out-dir>/public/ and
+# sycamore-assets.json at <out-dir>, with root-relative public URLs for
+# bootstrap/js/wasm and, when enabled, stylesheet (no /public URL prefix).
 # SPA generates an HTML shell; SSR leaves HTML (and any SSG/export) to the app.
 
 [serve]
@@ -71,5 +76,5 @@ enable = true
 # [tools.tailwindcss]
 # enable = true
 # input = "index.css" # Default; relative to this config file.
-# output = "index.css" # Relative to the build output directory (dist by default).
+# output = "index.css" # Relative to <out-dir>/public/ (dist/public by default).
 # version = "4.3.5" # Pinned default.

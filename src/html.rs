@@ -68,10 +68,11 @@ fn stylesheet_href(out_dir: &Path, stylesheet: &Path) -> Result<String> {
     Ok(format!("./{}", output_url(out_dir, stylesheet)?))
 }
 
-/// Publish the stable browser bootstrap and its public asset manifest.
+/// Publish the browser bootstrap under public/ and private manifest at the build root.
 /// URLs in the manifest are rooted at the public output root, never filesystem paths.
 pub(crate) fn generate_bootstrap_and_manifest(
     out_dir: &Path,
+    public_dir: &Path,
     output_name: &str,
     stylesheet: Option<&Path>,
 ) -> Result<()> {
@@ -95,11 +96,11 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
     if let Some(stylesheet) = stylesheet {
         manifest.push_str(&format!(
             ",\n  \"stylesheet\": \"/{}\"",
-            output_url(out_dir, stylesheet)?
+            output_url(public_dir, stylesheet)?
         ));
     }
     manifest.push_str("\n}\n");
-    atomic_write(&out_dir.join(bootstrap_name), bootstrap.as_bytes())?;
+    atomic_write(&public_dir.join(bootstrap_name), bootstrap.as_bytes())?;
     atomic_write(&out_dir.join("sycamore-assets.json"), manifest.as_bytes())?;
     Ok(())
 }
@@ -336,12 +337,13 @@ mod tests {
     #[test]
     fn publishes_bootstrap_and_root_relative_asset_manifest() {
         let temp = tempfile::tempdir().unwrap();
-        let out = temp.path().join("dist");
+        let directory = temp.path().join("dist");
+        let out = directory.join("public");
         fs::create_dir_all(out.join("assets")).unwrap();
         let stylesheet = out.join("assets/site styles.css");
         fs::write(&stylesheet, "body{}").unwrap();
 
-        generate_bootstrap_and_manifest(&out, "app name", Some(&stylesheet)).unwrap();
+        generate_bootstrap_and_manifest(&directory, &out, "app name", Some(&stylesheet)).unwrap();
 
         assert_eq!(
             fs::read_to_string(out.join("app name.bootstrap.js")).unwrap(),
@@ -349,9 +351,10 @@ mod tests {
 init().catch(error => console.error("Failed to initialize WASM:", error));
 "#
         );
-        let manifest: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(out.join("sycamore-assets.json")).unwrap())
-                .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(directory.join("sycamore-assets.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(manifest["bootstrap"], "/app%20name.bootstrap.js");
         assert_eq!(manifest["js"], "/app%20name.js");
         assert_eq!(manifest["wasm"], "/app%20name_bg.wasm");
@@ -363,13 +366,15 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
     fn sycamore_app_bootstrap_does_not_replace_bindgen_glue() {
         let temp = tempfile::tempdir().unwrap();
         let out = temp.path();
+        let public = out.join("public");
+        fs::create_dir(&public).unwrap();
         let glue = b"// wasm-bindgen generated glue";
-        fs::write(out.join("sycamore.js"), glue).unwrap();
+        fs::write(public.join("sycamore.js"), glue).unwrap();
 
-        generate_bootstrap_and_manifest(out, "sycamore", None).unwrap();
+        generate_bootstrap_and_manifest(out, &public, "sycamore", None).unwrap();
 
-        assert_eq!(fs::read(out.join("sycamore.js")).unwrap(), glue);
-        assert!(out.join("sycamore.bootstrap.js").is_file());
+        assert_eq!(fs::read(public.join("sycamore.js")).unwrap(), glue);
+        assert!(public.join("sycamore.bootstrap.js").is_file());
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(out.join("sycamore-assets.json")).unwrap()).unwrap();
         assert_eq!(manifest["bootstrap"], "/sycamore.bootstrap.js");

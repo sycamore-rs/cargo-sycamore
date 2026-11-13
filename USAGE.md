@@ -14,7 +14,7 @@ Options:
 
 ```sh
 cargo sycamore build --manifest-path path/to/Cargo.toml
-cargo sycamore build --package my-app --bin client --out-dir public
+cargo sycamore build --package my-app --bin client --out-dir dist/site
 cargo sycamore build --help
 ```
 
@@ -37,12 +37,28 @@ the workspace `Cargo.lock` after Cargo updates it; that version of
 Release builds also optimize generated `*_bg.wasm` with `wasm-opt` by default.
 When configured, Tailwind CSS runs as part of this client build.
 
-Public files, including HTML when generated, JavaScript, WASM, bootstrap, manifest,
-stylesheet and copied assets, go into `dist/` by default. This is the public asset
-directory, not a location for the backend executable; Cargo places the executable
-in its target directory. TypeScript declarations are disabled with
-wasm-bindgen's `--no-typescript` flag. An explicit `--out-dir` is relative to the
-current working directory. Custom Cargo target directories are supported.
+`[build].out-dir` is the build root and defaults to `dist/`. Browser-facing files
+(HTML when generated, JavaScript, WASM, bootstrap, stylesheet and copied assets)
+go under `dist/public/`; the private `sycamore-assets.json` manifest is beside
+that directory at `dist/sycamore-assets.json`. The build root is not a location for
+the backend executable; Cargo places the executable in its target directory.
+TypeScript declarations are disabled with wasm-bindgen's `--no-typescript` flag.
+An explicit `--out-dir` is relative to the current working directory. Custom Cargo
+target directories are supported.
+
+The resulting layout is:
+
+```text
+dist/
+├── sycamore-assets.json       # private build/backend manifest
+└── public/                    # static dev server root; browser-facing files
+    ├── index.html             # SPA mode only
+    ├── <output_name>.js
+    ├── <output_name>_bg.wasm
+    ├── <output_name>.bootstrap.js
+    ├── index.css              # when Tailwind is enabled
+    └── ...                    # copied assets
+```
 
 The app must depend (directly or transitively) on a released registry version of
 `wasm-bindgen`. Missing dependencies, multiple locked `wasm-bindgen` versions,
@@ -52,11 +68,13 @@ be unified, even if only one is used by the selected app.
 
 Debug builds download `wasm-bindgen-cli`; release builds also download
 `wasm-opt` unless disabled. When configured, Tailwind CSS is downloaded and run
-in either mode. The command generates browser bindings and public bootstrap/manifest
-assets; in SPA mode it also generates an HTML entrypoint. It copies static
-files/directories listed in `[build].assets` (see below). In SSR mode, HTML is
-app-owned and no build-time shell is generated. Use `serve` for the development
-server. Existing files in the output directory are not cleaned. Set `GITHUB_TOKEN`
+in either mode. The command generates browser bindings and a bootstrap under
+`public/`, plus the manifest at the build root; in SPA mode it also generates an
+HTML entrypoint under `public/`. It copies static files/directories listed in `[build].assets` into
+`public/` (see below). In SSR mode, HTML is app-owned and no build-time shell is
+generated. Use `serve` for the development server. Existing files in the output
+directory are not cleaned automatically. When upgrading to this layout, clean
+`dist/` once if needed to remove files left by the old layout. Set `GITHUB_TOKEN`
 if needed for GitHub API
 rate limits; it is passed to the downloader for API requests only.
 
@@ -101,8 +119,8 @@ Enable the standalone Tailwind CSS compiler explicitly in `Sycamore.toml`:
 [tools.tailwindcss]
 enable = true
 input = "styles/input.css"
-# Optional: defaults to index.css inside the resolved build output directory.
-output = "index.css"
+# Optional: defaults to index.css inside the resolved public/ directory.
+output = "index.css" # written under <out-dir>/public/
 # Optional: pinned default, not a moving latest release.
 version = "4.3.5"
 ```
@@ -124,11 +142,12 @@ input = "styles/input.css"
   Create the input file; for Tailwind v4, start with `@import "tailwindcss";`.
 - Input paths are relative to the config file (or metadata's `Cargo.toml`), not
   the invocation directory. Absolute input paths are preserved.
-- Output paths are always relative to the resolved build output directory and
+- Output paths are always relative to the resolved `public/` directory and
   default to `index.css`. For example, `output = "output.css"` writes
-  `dist/output.css`; `output = "assets/site.css"` writes `dist/assets/site.css`.
-  Both follow `--out-dir` / `[build].out-dir` overrides automatically. Absolute
-  output paths and `..` components are rejected; do not include the `dist/` prefix.
+  `dist/public/output.css`; `output = "assets/site.css"` writes
+  `dist/public/assets/site.css`. Both follow `--out-dir` / `[build].out-dir`
+  overrides automatically. Absolute output paths and `..` components are rejected;
+  do not include the build-root or `public/` prefix.
 - Version defaults to **4.3.5**. The matching standalone executable is downloaded
   through the normal tool cache, so npm/Node installation is not required.
 - The compiler runs once for each successful Cargo/wasm-bindgen build, including
@@ -156,10 +175,10 @@ the source template is never modified. Remove any manually added Tailwind link
 from earlier setups to avoid duplicates. Keep input/source files outside generated
 output directories so watch can see edits.
 
-### HTML entrypoint and public asset manifest
+### HTML entrypoint and private asset manifest
 
-In the default SPA build mode, each successful build writes `index.html` into the
-public output directory. If an `index.html` exists beside the selected client
+In the default SPA build mode, each successful build writes `index.html` into
+`<build-root>/public/`. If an `index.html` exists beside the selected client
 package's `Cargo.toml`, it is used as the template; otherwise the bundled
 `templates/index.html` is used. In a workspace, this means the selected client
 package's root, not necessarily the workspace root. SSR mode deliberately skips
@@ -182,8 +201,9 @@ are supplied by the parser, and user content/scripts are preserved (formatting
 may be normalized). A previous `script[data-cargo-sycamore]` is replaced rather
 than duplicated; that marker is reserved for generated startup scripts.
 
-Every build mode also writes `<output_name>.bootstrap.js` and
-`sycamore-assets.json` to the public output directory. The manifest contains the
+Every build mode also writes `<output_name>.bootstrap.js` under
+`<build-root>/public/` and `sycamore-assets.json` at the build root (for example,
+`dist/sycamore-assets.json`). The manifest contains the
 fields `bootstrap`, `js`, and `wasm`, plus `stylesheet` when Tailwind CSS is enabled.
 Values are root-relative public URLs (for example, `/my_app.bootstrap.js`,
 `/my_app.js`, `/my_app_bg.wasm`, and optionally `/index.css`), never filesystem
@@ -228,7 +248,8 @@ a configured `example`. Without an example selection, normal library/binary targ
 selection is unchanged.
 
 SPA examples use the same package-root `index.html` template and default package
-`dist/` output as normal builds; SSR examples do not generate a shell. Use
+`dist/` build root (with browser files under `dist/public/`) as normal builds; SSR
+examples do not generate a shell. Use
 `--out-dir` to keep separate outputs when switching targets. `serve --example` includes watching and browser autoreload
 according to your usual serve settings.
 
@@ -237,7 +258,7 @@ according to your usual serve settings.
 ```sh
 cargo sycamore watch
 cargo sycamore watch --release
-cargo sycamore watch --package my-app --out-dir public
+cargo sycamore watch --package my-app --out-dir dist/site
 cargo sycamore watch --config path/to/Sycamore.toml
 ```
 
@@ -280,26 +301,29 @@ future edits.
 cargo sycamore serve
 cargo sycamore serve --port 9000
 cargo sycamore s --port 9000 # shorthand for serve
-cargo sycamore serve --release --package my-app --out-dir public
+cargo sycamore serve --release --package my-app --out-dir dist/site
 ```
 
 `serve` binds to **http://127.0.0.1:8080** by default and runs the selected build
 and watcher. In SPA mode it serves the public asset directory and can proxy chosen
 routes to a separately built native application server. In SSR mode it runs the
 native server and proxies application requests; it does not serve a frontend. The
-build output directory (`dist/` by default) contains public assets only, never the
-backend executable. Build and watch do not need development-server ports; `serve`
+build root (`dist/` by default) contains `public/` (the browser files served by the
+static dev server) and the sibling private `sycamore-assets.json` manifest, never
+the backend executable. Build and watch do not need development-server ports; `serve`
 requires `[serve].backend-port` whenever `[build.server]` is configured, even if
 the application is reached directly on a separate origin.
 
 A configured backend must honor the runtime contract supplied by the supervisor:
 `SYCAMORE_SERVER_ADDR` is its loopback listen address,
-`SYCAMORE_PUBLIC_DIR` is the snapshot of public assets, and
-`SYCAMORE_ASSET_MANIFEST` is the path to `sycamore-assets.json` in that snapshot.
-The backend must bind the supplied address and use the public directory/manifest
-as appropriate. No framework integration crate is included yet. The tool does not
-prescribe production deployment topology; static generation/export is
-application-owned.
+`SYCAMORE_PUBLIC_DIR` is `<snapshot>/public`, and
+`SYCAMORE_ASSET_MANIFEST` is `<snapshot>/sycamore-assets.json`. Backend snapshots
+contain the manifest beside `public/`. The backend must bind the supplied address
+and use the public directory/manifest as appropriate. The static development
+server serves only `public/`; public URLs remain root-relative (for example,
+`/app.js`), with no `/public` URL prefix. No framework integration crate is
+included yet. The tool does not prescribe production deployment topology; static
+generation/export is application-owned.
 
 For a typical SPA with selected backend routes proxied by the same-origin dev
 server:
@@ -378,9 +402,9 @@ reserved endpoints do not fall back. These settings and `serve-frontend`,
 `backend-port`, and `forward-routes` can be reloaded when configuration changes.
 Build/watch do not require these runtime ports, but serve validation applies them.
 
-The development supervisor snapshots the backend executable and public assets,
-waits for TCP readiness, and restores the previous backend generation if a restart
-fails. It manages and kills only the direct child process; backend grandchildren
+The development supervisor snapshots the backend executable and the build root,
+including sibling `public/` and `sycamore-assets.json`, waits for TCP readiness,
+and restores the previous backend generation if a restart fails. It manages and kills only the direct child process; backend grandchildren
 are not supported. Public assets are also published as successful frontend
 snapshots. Compilation/configuration failures preserve the last good served output.
 
@@ -421,8 +445,8 @@ Create a `Sycamore.toml` in your project (a commented template is included here)
 [build]
 mode = "spa" # default; use "ssr" for server-rendered HTML
 manifest-path = "Cargo.toml"
-out-dir = "dist" # public assets only, not the backend executable
-# assets = ["favicon.ico", "images"] # optional files/directories to copy
+out-dir = "dist" # build root; browser files are under dist/public/
+# assets = ["favicon.ico", "images"] # copied under dist/public/
 
 [build.client]
 package = "web"
@@ -447,8 +471,8 @@ spa = false
 ```
 
 The precedence is **explicit CLI flags → configuration → built-in defaults**.
-For example, `cargo sycamore b --out-dir public --release` overrides the configured
-output directory and selects the release profile. Client selectors and feature
+For example, `cargo sycamore b --out-dir dist/site --release` overrides the
+configured build root and selects the release profile. Client selectors and feature
 settings are configured under `[build.client]`; client CLI target selectors
 override configured target selectors. The client and server package/feature
 settings are otherwise independent.
@@ -464,10 +488,11 @@ feature sets default to `[]` and default features to `true`; the server uses the
 same `--release` selection as the client.
 
 The shared `[build]` keys `manifest-path`, `out-dir`, and `assets` remain shared.
-The `out-dir` is always the public asset directory. All modes emit
-`<output_name>.bootstrap.js` and `sycamore-assets.json`; SPA also generates the
-HTML shell, while SSR leaves HTML generation to the application. Static site
-generation/export is not performed by the tool.
+The `out-dir` is the build root (`dist/` by default), with browser-facing output
+under its `public/` child and `sycamore-assets.json` beside that child. All modes
+emit `<output_name>.bootstrap.js` and `sycamore-assets.json`; SPA also generates
+the HTML shell under `public/`, while SSR leaves HTML generation to the
+application. Static site generation/export is not performed by the tool.
 
 `[serve]` keys are `port` (8080), `autoreload` (`true`), `spa` (`false`),
 `serve-frontend` (defaults by build mode), `backend-port` (required at serve time
@@ -481,7 +506,7 @@ be nonzero and differ from the public port. See
 | Client package | `--package` / `-p` | `build.client.package` | Cargo's default members |
 | Client binary | `--bin` | `build.client.bin` | cdylib or sole binary |
 | Client example | `--example` | `build.client.example` | none |
-| Output | `--out-dir` | `build.out-dir` | `<package>/dist` (public assets) |
+| Output | `--out-dir` | `build.out-dir` | `<package>/dist` (build root; browser files in `public/`) |
 | Static assets | — | `build.assets` | `[]` |
 | Client features | — | `build.client.features` | `[]` |
 | Client default features | — | `build.client.default-features` | `true` |
@@ -492,31 +517,32 @@ be nonzero and differ from the public port. See
 
 ### Static assets
 
-List files or directories to copy into the output directory:
+List files or directories to copy under the build root's `public/` directory:
 
 ```toml
 [build]
 assets = [
-    "favicon.ico",                              # dist/favicon.ico
-    "images",                                   # dist/images/ (recursive)
-    { from = "logo.svg", to = "img/brand.svg" },  # dist/img/brand.svg
-    { from = "fonts", to = "webfonts" },         # dist/webfonts/ (recursive)
-    { from = "public", to = "." },         # public/* → dist/*
+    "favicon.ico",                                # dist/public/favicon.ico
+    "images",                                     # dist/public/images/ (recursive)
+    { from = "logo.svg", to = "img/brand.svg" }, # dist/public/img/brand.svg
+    { from = "fonts", to = "webfonts" },          # dist/public/webfonts/ (recursive)
+    { from = "public", to = "." },                # public/* → dist/public/*
 ]
 ```
 
 Source paths are relative to the selected config file (or the containing
 `Cargo.toml` for package metadata). Absolute source paths are also supported.
-Destinations are relative to the output directory; absolute paths, empty paths,
-and `..` components are rejected. Parent directories are created as needed.
-Using `to = "."` copies a directory’s contents directly into the output directory,
+Destinations (`to`) are relative to `public/`, not the build root; absolute paths,
+empty paths, and `..` components are rejected. Parent directories are created as
+needed. Using `to = "."` copies a directory’s contents directly into `public/`,
 preserving nested directories. Using `to = "."` with a file is an error.
 
 Assets are copied in array order, overwriting existing files at the same paths.
 Missing sources and copy failures are errors. Generated HTML, JavaScript, WASM,
-and Tailwind output take precedence over assets with the same names. As with other build output,
-old copied assets are not cleaned up automatically. A source directory must not
-contain the output directory. Asset changes trigger rebuilds in watch/serve mode,
+and Tailwind output take precedence over assets with the same paths under
+`public/`. As with other build output, old copied assets are not cleaned up
+automatically. A source directory must not contain the output directory. Asset
+changes trigger rebuilds in watch/serve mode,
 including sources outside the workspace.
 
 WASM optimization settings live under `[tools.wasm-opt]`:
@@ -539,7 +565,7 @@ Alternatively, use the same schema inside the package's `Cargo.toml`:
 ```toml
 [package.metadata.sycamore.build]
 mode = "ssr"
-out-dir = "public"
+out-dir = "site-output"
 
 [package.metadata.sycamore.build.client]
 package = "web"
@@ -592,8 +618,8 @@ back to another config.
 CLI paths, including `--config`, are relative to your current working directory.
 Paths written **inside** the config are relative to the directory containing that
 file. A config file doesn't change the current project unless it sets
-`manifest-path`. Without an output override, output still defaults to the selected
-package's `dist/` directory.
+`manifest-path`. Without an output override, the build root still defaults to the
+selected package's `dist/` directory, with browser files under `dist/public/`.
 
 Unknown keys, malformed values, and CLI-only keys such as `release` in the config
 are errors. Set `default-features = false` to pass `--no-default-features` to Cargo;

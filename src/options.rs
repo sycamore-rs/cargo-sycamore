@@ -36,7 +36,7 @@ pub struct BuildArgs {
     /// Optimize release WASM (default: true; also [tools.wasm-opt].enable; debug builds skip it).
     #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true, action = clap::ArgAction::Set)]
     pub wasm_opt: Option<bool>,
-    /// Output directory for JS/WASM bindings (also configurable in Sycamore.toml).
+    /// Build output root; browser files go under public/ (also configurable in Sycamore.toml).
     #[arg(long, value_name = "PATH")]
     pub out_dir: Option<PathBuf>,
     /// Explicit config file; otherwise discover Sycamore.toml or Cargo package metadata.
@@ -99,7 +99,7 @@ pub struct TailwindConfig {
 #[derive(Debug)]
 pub struct TailwindOptions {
     pub input: PathBuf,
-    /// Relative to the selected build output directory; defaults to index.css.
+    /// Relative to the public/ directory inside the build output; defaults to index.css.
     pub output: Option<PathBuf>,
     pub version: String,
 }

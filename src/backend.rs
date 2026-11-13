@@ -34,6 +34,7 @@ struct Generation {
     _directory: TempDir,
     executable: PathBuf,
     public_dir: PathBuf,
+    manifest_path: PathBuf,
 }
 
 impl BackendSupervisor {
@@ -47,7 +48,7 @@ impl BackendSupervisor {
     pub(crate) fn restart(
         &mut self,
         executable: &Path,
-        public_dir: &Path,
+        output_dir: &Path,
         backend_port: u16,
     ) -> Result<()> {
         let port_is_managed = self
@@ -60,7 +61,7 @@ impl BackendSupervisor {
 
         // Prepare the generation before disturbing a working server. In particular,
         // a copy error must not take down the currently served build.
-        let next = snapshot(executable, public_dir)?;
+        let next = snapshot(executable, output_dir)?;
 
         let mut previous = self.running.take();
         if let Some(old) = previous.as_mut()
@@ -141,7 +142,7 @@ impl Drop for BackendSupervisor {
     }
 }
 
-fn snapshot(executable: &Path, public_dir: &Path) -> Result<Generation> {
+fn snapshot(executable: &Path, output_dir: &Path) -> Result<Generation> {
     let executable = executable
         .canonicalize()
         .with_context(|| format!("resolving backend executable {}", executable.display()))?;
@@ -154,9 +155,23 @@ fn snapshot(executable: &Path, public_dir: &Path) -> Result<Generation> {
         );
     }
 
-    let public_source = public_dir
+    let output_root = output_dir
         .canonicalize()
-        .with_context(|| format!("resolving public directory {}", public_dir.display()))?;
+        .with_context(|| format!("resolving build output directory {}", output_dir.display()))?;
+    if !fs::metadata(&output_root)
+        .with_context(|| format!("reading build output directory {}", output_root.display()))?
+        .is_dir()
+    {
+        bail!(
+            "build output path is not a directory: {}",
+            output_root.display()
+        );
+    }
+
+    let public_path = output_root.join("public");
+    let public_source = public_path
+        .canonicalize()
+        .with_context(|| format!("resolving public directory {}", public_path.display()))?;
     if !fs::metadata(&public_source)
         .with_context(|| format!("reading public directory {}", public_source.display()))?
         .is_dir()
@@ -164,6 +179,16 @@ fn snapshot(executable: &Path, public_dir: &Path) -> Result<Generation> {
         bail!(
             "public path is not a directory: {}",
             public_source.display()
+        );
+    }
+
+    let manifest_source = output_root.join("sycamore-assets.json");
+    let manifest_metadata = fs::metadata(&manifest_source)
+        .with_context(|| format!("reading asset manifest {}", manifest_source.display()))?;
+    if !manifest_metadata.is_file() {
+        bail!(
+            "asset manifest is not a regular file: {}",
+            manifest_source.display()
         );
     }
 
@@ -191,6 +216,9 @@ fn snapshot(executable: &Path, public_dir: &Path) -> Result<Generation> {
     let executable_copy = directory.path().join(executable_name);
     copy_regular_file(&executable, &executable_copy)?;
 
+    let manifest_copy = directory.path().join("sycamore-assets.json");
+    copy_regular_file(&manifest_source, &manifest_copy)?;
+
     let public_copy = directory.path().join("public");
     fs::create_dir(&public_copy).context("creating snapshot public directory")?;
     copy_public_directory(&public_source, &public_copy)?;
@@ -209,6 +237,9 @@ fn snapshot(executable: &Path, public_dir: &Path) -> Result<Generation> {
         public_dir: public_copy
             .canonicalize()
             .context("resolving snapshot public directory")?,
+        manifest_path: manifest_copy
+            .canonicalize()
+            .context("resolving snapshot asset manifest")?,
         _directory: directory,
     })
 }
@@ -326,10 +357,7 @@ fn launch(generation: Generation, backend_port: u16) -> Result<(Child, Generatio
     let mut child = Command::new(&generation.executable)
         .env("SYCAMORE_SERVER_ADDR", &address)
         .env("SYCAMORE_PUBLIC_DIR", &generation.public_dir)
-        .env(
-            "SYCAMORE_ASSET_MANIFEST",
-            generation.public_dir.join("sycamore-assets.json"),
-        )
+        .env("SYCAMORE_ASSET_MANIFEST", &generation.manifest_path)
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .spawn()
@@ -434,6 +462,7 @@ fn main() {
     let manifest = env::var("SYCAMORE_ASSET_MANIFEST").unwrap();
     assert!(std::path::Path::new(&public_dir).is_dir());
     assert!(std::path::Path::new(&manifest).is_file());
+    assert_eq!(std::path::Path::new(&manifest).parent(), std::path::Path::new(&public_dir).parent());
     let listener = TcpListener::bind(address).unwrap();
     for _ in listener.incoming() { thread::sleep(Duration::from_millis(1)); }
 }
@@ -459,14 +488,21 @@ fn main() {
         let source = tempfile::tempdir().unwrap();
         let exe = source.path().join("backend");
         executable(&exe, "#!/bin/sh\nexit 0\n");
-        let public = source.path().join("public");
+        let output = source.path().join("dist");
+        let public = output.join("public");
         fs::create_dir_all(public.join(".hidden/nested")).unwrap();
         fs::write(public.join(".hidden/nested/file"), "asset").unwrap();
+        fs::write(output.join("sycamore-assets.json"), "manifest").unwrap();
 
-        let generation = snapshot(&exe, &public).unwrap();
+        let generation = snapshot(&exe, &output).unwrap();
         assert_eq!(
             fs::read(generation.public_dir.join(".hidden/nested/file")).unwrap(),
             b"asset"
+        );
+        assert_eq!(fs::read(&generation.manifest_path).unwrap(), b"manifest");
+        assert_eq!(
+            generation.manifest_path.parent(),
+            generation.public_dir.parent()
         );
         assert_eq!(
             fs::metadata(generation.executable)
@@ -485,10 +521,12 @@ fn main() {
         let source = tempfile::tempdir().unwrap();
         let exe = source.path().join("backend");
         executable(&exe, "#!/bin/sh\nexit 0\n");
-        let public = source.path().join("public");
-        fs::create_dir(&public).unwrap();
+        let output = source.path().join("dist");
+        let public = output.join("public");
+        fs::create_dir_all(&public).unwrap();
+        fs::write(output.join("sycamore-assets.json"), "manifest").unwrap();
         symlink(&public, public.join("loop")).unwrap();
-        let error = snapshot(&exe, &public).unwrap_err();
+        let error = snapshot(&exe, &output).unwrap_err();
         assert!(format!("{error:#}").contains("cycle"));
     }
 
@@ -512,9 +550,10 @@ fn main() {
         let server = compile_server(source.path());
         let broken = source.path().join("broken");
         executable(&broken, "#!/bin/sh\nexit 9\n");
-        let public = source.path().join("public");
-        fs::create_dir(&public).unwrap();
-        fs::write(public.join("sycamore-assets.json"), "{}").unwrap();
+        let output = source.path().join("dist");
+        let public = output.join("public");
+        fs::create_dir_all(&public).unwrap();
+        fs::write(output.join("sycamore-assets.json"), "{}").unwrap();
         fs::write(public.join("index.html"), "before").unwrap();
         let backend_port = port();
         let mut failed_port = port();
@@ -523,7 +562,7 @@ fn main() {
         }
 
         let mut supervisor = BackendSupervisor::new();
-        supervisor.restart(&server, &public, backend_port).unwrap();
+        supervisor.restart(&server, &output, backend_port).unwrap();
         assert!(TcpStream::connect(("127.0.0.1", backend_port)).is_ok());
         let old_snapshot = supervisor
             .running
@@ -536,7 +575,7 @@ fn main() {
         assert_eq!(fs::read_to_string(&old_snapshot).unwrap(), "before");
 
         let error = supervisor
-            .restart(&broken, &public, failed_port)
+            .restart(&broken, &output, failed_port)
             .unwrap_err();
         assert!(format!("{error:#}").contains("exited before becoming ready"));
         assert_eq!(
@@ -564,15 +603,15 @@ fn main() {
     fn first_start_refuses_an_occupied_port() {
         let source = tempfile::tempdir().unwrap();
         let server = compile_server(source.path());
-        let public = source.path().join("public");
-        fs::create_dir(&public).unwrap();
-        fs::write(public.join("sycamore-assets.json"), "{}").unwrap();
+        let output = source.path().join("dist");
+        fs::create_dir_all(output.join("public")).unwrap();
+        fs::write(output.join("sycamore-assets.json"), "{}").unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let occupied_port = listener.local_addr().unwrap().port();
 
         let mut supervisor = BackendSupervisor::new();
         let error = supervisor
-            .restart(&server, &public, occupied_port)
+            .restart(&server, &output, occupied_port)
             .unwrap_err();
         assert!(format!("{error:#}").contains("already occupied"));
         assert!(supervisor.running.is_none());

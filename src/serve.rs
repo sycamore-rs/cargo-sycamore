@@ -41,7 +41,7 @@ const RELOAD_CLIENT: &str = include_str!("reload.js");
 /// watcher thread, never on Tokio's async executor.
 pub fn serve(args: ServeArgs) -> Result<()> {
     let options = Options::resolve_serve(&args)?;
-    let directory = build::output_directory(&options)?;
+    let directory = build::output_directory(&options)?.join("public");
     watch::validate(&options)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -108,7 +108,7 @@ async fn serve_async(args: ServeArgs, options: Options, directory: PathBuf) -> R
                     if options.port != state.port && options.port != 0 {
                         eprintln!("warning: restart serve to change the public port");
                     }
-                    let generation = snapshot_frontend(&output.directory)?;
+                    let generation = snapshot_frontend(&output.directory.join("public"))?;
                     if let Some(executable) = &output.server {
                         let port = options.backend_port.ok_or_else(|| {
                             anyhow!("[serve].backend-port is required to run the backend")

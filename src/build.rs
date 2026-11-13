@@ -23,6 +23,7 @@ const WASM_TARGET: &str = "wasm32-unknown-unknown";
 /// Public results from a completed application build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildOutput {
+    /// Build root containing sycamore-assets.json and the public/ directory.
     pub directory: PathBuf,
     pub server: Option<PathBuf>,
 }
@@ -45,7 +46,7 @@ pub fn build_application(options: &Options) -> Result<BuildOutput> {
     })
 }
 
-/// Compatibility entry point: build the client and return its public directory.
+/// Build the application and return its build output directory.
 pub fn build(options: &Options) -> Result<PathBuf> {
     Ok(build_application(options)?.directory)
 }
@@ -197,7 +198,8 @@ fn build_client_with(
     } else {
         None
     };
-    let out_dir = package_output_directory(options, package);
+    let directory = package_output_directory(options, package);
+    let out_dir = directory.join("public");
     fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     // Publish generated artifacts after assets so static inputs cannot replace
     // the freshly generated bindings, optimized WASM, or stylesheet.
@@ -236,7 +238,12 @@ fn build_client_with(
     } else {
         None
     };
-    crate::html::generate_bootstrap_and_manifest(&out_dir, output_name, stylesheet.as_deref())?;
+    crate::html::generate_bootstrap_and_manifest(
+        &directory,
+        &out_dir,
+        output_name,
+        stylesheet.as_deref(),
+    )?;
     if generate_shell {
         crate::html::generate_with_stylesheet(
             project_root.as_std_path(),
@@ -245,8 +252,8 @@ fn build_client_with(
             stylesheet.as_deref(),
         )?;
     }
-    eprintln!("Built {} → {}", package.name, out_dir.display());
-    Ok(out_dir)
+    eprintln!("Built {} → {}", package.name, directory.display());
+    Ok(directory)
 }
 
 fn build_server(
@@ -1002,10 +1009,10 @@ printf '%s\n' {}; fi"#,
             assert!(args.contains("--target\nweb\n--no-typescript\n--out-dir\n"));
             assert!(root.join("dist").is_dir());
             assert_eq!(
-                fs::read_to_string(root.join("dist/static/renamed.txt")).unwrap(),
+                fs::read_to_string(root.join("dist/public/static/renamed.txt")).unwrap(),
                 "static asset"
             );
-            let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
+            let html = fs::read_to_string(root.join("dist/public/index.html")).unwrap();
             assert!(html.contains("./test_app.js"));
             assert!(args.contains("--out-name\ntest_app\n"));
         }
@@ -1024,8 +1031,8 @@ printf js > "$out/$name.js"
 printf wasm > "$out/${name}_bg.wasm""#,
             );
             let out = root.join("dist");
-            fs::create_dir(&out).unwrap();
-            fs::write(out.join("index.html"), "user-owned index").unwrap();
+            fs::create_dir_all(out.join("public")).unwrap();
+            fs::write(out.join("public/index.html"), "user-owned index").unwrap();
             let options = Options {
                 manifest_path: Some(root.join("Cargo.toml")),
                 mode: crate::options::BuildMode::Ssr,
@@ -1052,7 +1059,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 Some(root.join("custom-native/test-app").as_path())
             );
             assert_eq!(
-                fs::read_to_string(output.directory.join("index.html")).unwrap(),
+                fs::read_to_string(output.directory.join("public/index.html")).unwrap(),
                 "user-owned index"
             );
             let manifest: serde_json::Value = serde_json::from_slice(
@@ -1082,9 +1089,9 @@ printf wasm > "$out/${name}_bg.wasm""#,
             let root = temp.path();
             let cargo = mock_application_cargo(root, true);
             let out = root.join("dist");
-            fs::create_dir(&out).unwrap();
-            fs::write(out.join("index.html"), "previous HTML").unwrap();
-            fs::write(out.join("previous.txt"), "previous asset").unwrap();
+            fs::create_dir_all(out.join("public")).unwrap();
+            fs::write(out.join("public/index.html"), "previous HTML").unwrap();
+            fs::write(out.join("public/previous.txt"), "previous asset").unwrap();
             let options = Options {
                 manifest_path: Some(root.join("Cargo.toml")),
                 mode: crate::options::BuildMode::Ssr,
@@ -1102,14 +1109,14 @@ printf wasm > "$out/${name}_bg.wasm""#,
             .unwrap_err();
             assert!(format!("{error:#}").contains("native cargo build failed"));
             assert_eq!(
-                fs::read_to_string(out.join("index.html")).unwrap(),
+                fs::read_to_string(out.join("public/index.html")).unwrap(),
                 "previous HTML"
             );
             assert_eq!(
-                fs::read_to_string(out.join("previous.txt")).unwrap(),
+                fs::read_to_string(out.join("public/previous.txt")).unwrap(),
                 "previous asset"
             );
-            assert_eq!(fs::read_dir(out).unwrap().count(), 2);
+            assert_eq!(fs::read_dir(out.join("public")).unwrap().count(), 2);
         }
 
         #[test]
@@ -1125,7 +1132,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 let cargo = mock_cargo_target(root, false, example.then_some("counter"));
                 fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
                 let out = root.join("custom-output");
-                let module = out.join(format!("{name}_bg.wasm"));
+                let module = out.join("public").join(format!("{name}_bg.wasm"));
                 let bindgen = root.join("wasm-bindgen");
                 script(
                     &bindgen,
@@ -1175,10 +1182,10 @@ printf wasm > "$out/${name}_bg.wasm""#,
                             module.display()
                         ))
                 );
-                assert!(out.join("index.html").exists());
+                assert!(out.join("public/index.html").exists());
                 assert_eq!(
-                    fs::read_dir(out).unwrap().count(),
-                    4,
+                    fs::read_dir(out.join("public")).unwrap().count(),
+                    3,
                     "temporary optimizer output must not remain"
                 );
             }
@@ -1191,11 +1198,11 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 let root = temp.path();
                 let cargo = mock_cargo(root, false);
                 fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
-                let module = root.join("dist/test_app_bg.wasm");
+                let module = root.join("dist/public/test_app_bg.wasm");
                 if failure == "download" {
-                    fs::create_dir(root.join("dist")).unwrap();
+                    fs::create_dir_all(root.join("dist/public")).unwrap();
                     fs::write(&module, b"previous output").unwrap();
-                    fs::write(root.join("dist/index.html"), "previous HTML").unwrap();
+                    fs::write(root.join("dist/public/index.html"), "previous HTML").unwrap();
                 }
                 let bindgen = root.join("wasm-bindgen");
                 script(&bindgen, &format!("printf original > {}", quote(&module)));
@@ -1222,14 +1229,14 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 if failure == "download" {
                     assert_eq!(fs::read(&module).unwrap(), b"previous output");
                     assert_eq!(
-                        fs::read_to_string(root.join("dist/index.html")).unwrap(),
+                        fs::read_to_string(root.join("dist/public/index.html")).unwrap(),
                         "previous HTML"
                     );
-                    assert_eq!(fs::read_dir(root.join("dist")).unwrap().count(), 2);
+                    assert_eq!(fs::read_dir(root.join("dist/public")).unwrap().count(), 2);
                 } else {
                     assert_eq!(fs::read(&module).unwrap(), b"original");
-                    assert!(!root.join("dist/index.html").exists());
-                    assert_eq!(fs::read_dir(root.join("dist")).unwrap().count(), 1);
+                    assert!(!root.join("dist/public/index.html").exists());
+                    assert_eq!(fs::read_dir(root.join("dist/public")).unwrap().count(), 1);
                 }
             }
         }
@@ -1256,7 +1263,9 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 );
                 let out = root.join("custom-dist");
                 let explicit_output = release.then(|| PathBuf::from("assets/nested/styles.css"));
-                let output = out.join(explicit_output.as_deref().unwrap_or(Path::new("index.css")));
+                let output = out
+                    .join("public")
+                    .join(explicit_output.as_deref().unwrap_or(Path::new("index.css")));
                 let options = Options {
                     manifest_path: Some(root.join("Cargo.toml")),
                     out_dir: Some(out.clone()),
@@ -1300,7 +1309,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
                     ),
                     fs::canonicalize(root).unwrap()
                 );
-                let html = fs::read_to_string(out.join("index.html")).unwrap();
+                let html = fs::read_to_string(out.join("public/index.html")).unwrap();
                 assert!(html.contains("data-cargo-sycamore-tailwind"));
                 assert!(html.contains(if release {
                     "href=\"./assets/nested/styles.css\""
@@ -1334,9 +1343,9 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 let root = temp.path();
                 let cargo = mock_cargo(root, false);
                 fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
-                fs::create_dir(root.join("dist")).unwrap();
+                fs::create_dir_all(root.join("dist/public")).unwrap();
                 let input = if failure == "overwrite-input" {
-                    root.join("dist/input.css")
+                    root.join("dist/public/input.css")
                 } else {
                     root.join("input.css")
                 };
@@ -1346,12 +1355,12 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 let output = if failure == "overwrite-input" {
                     input.clone()
                 } else {
-                    root.join("dist/styles.css")
+                    root.join("dist/public/styles.css")
                 };
                 if failure != "overwrite-input" {
                     fs::write(&output, "previous CSS").unwrap();
                 }
-                fs::write(root.join("dist/index.html"), "previous HTML").unwrap();
+                fs::write(root.join("dist/public/index.html"), "previous HTML").unwrap();
                 let bindgen = root.join("wasm-bindgen");
                 script(&bindgen, "exit 0");
                 let tailwind = root.join("tailwindcss");
@@ -1362,7 +1371,12 @@ printf wasm > "$out/${name}_bg.wasm""#,
                     manifest_path: Some(root.join("Cargo.toml")),
                     tailwindcss: Some(TailwindOptions {
                         input,
-                        output: Some(output.strip_prefix(root.join("dist")).unwrap().to_owned()),
+                        output: Some(
+                            output
+                                .strip_prefix(root.join("dist/public"))
+                                .unwrap()
+                                .to_owned(),
+                        ),
                         version: "test-version".into(),
                     }),
                     ..Default::default()
@@ -1384,7 +1398,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
                     }
                 );
                 assert_eq!(
-                    fs::read_to_string(root.join("dist/index.html")).unwrap(),
+                    fs::read_to_string(root.join("dist/public/index.html")).unwrap(),
                     "previous HTML"
                 );
                 assert!(!fs::read_dir(root).unwrap().any(|entry| {
@@ -1431,7 +1445,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
             assert!(args.contains("custom-target/counter.wasm\n"));
             assert!(args.contains("--out-name\ncounter\n"));
             assert!(
-                fs::read_to_string(root.join("dist/index.html"))
+                fs::read_to_string(root.join("dist/public/index.html"))
                     .unwrap()
                     .contains("./counter.js")
             );
