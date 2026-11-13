@@ -142,6 +142,7 @@ struct WatchPlan {
     workspace: PathBuf,
     config: Option<PathBuf>,
     tailwind_input: Option<PathBuf>,
+    assets: Vec<PathBuf>,
     ignored: Vec<PathBuf>,
     roots: Vec<(PathBuf, RecursiveMode)>,
 }
@@ -216,10 +217,32 @@ impl WatchPlan {
                 }
             }
         }
+        let assets: Vec<_> = options
+            .assets
+            .iter()
+            .map(|asset| normalize(&asset.from))
+            .collect();
+        for asset in &assets {
+            // Watch parents recursively to handle directory contents, atomic
+            // replacement, and missing sources being created after a failed build.
+            if let Some(parent) = asset.parent()
+                && !roots.iter().any(|(root, mode)| {
+                    matches!(mode, RecursiveMode::Recursive) && parent.starts_with(root)
+                })
+                && let Some(existing) = parent.ancestors().find(|path| path.is_dir())
+            {
+                if let Some((_, mode)) = roots.iter_mut().find(|(root, _)| root == existing) {
+                    *mode = RecursiveMode::Recursive;
+                } else {
+                    roots.push((existing.to_owned(), RecursiveMode::Recursive));
+                }
+            }
+        }
         Ok(Self {
             workspace,
             config,
             tailwind_input,
+            assets,
             ignored: ignored.into_iter().collect(),
             roots,
         })
@@ -247,7 +270,9 @@ impl WatchPlan {
 
     fn relevant_path(&self, path: &Path) -> bool {
         self.config.as_deref() == Some(path)
-            || ((path.starts_with(&self.workspace) || self.tailwind_input.as_deref() == Some(path))
+            || ((path.starts_with(&self.workspace)
+                || self.tailwind_input.as_deref() == Some(path)
+                || self.assets.iter().any(|asset| path.starts_with(asset)))
                 && !is_editor_artifact(path)
                 && !path.file_name().is_some_and(|name| {
                     let name = name.to_string_lossy();
@@ -355,6 +380,7 @@ mod tests {
             workspace: root.clone(),
             config: Some(root.join("Sycamore.toml")),
             tailwind_input: None,
+            assets: Vec::new(),
             ignored: vec![
                 root.join("target"),
                 root.join("dist"),
@@ -395,6 +421,37 @@ mod tests {
         )
         .add_path(output);
         assert!(!plan.relevant(&event));
+    }
+
+    #[test]
+    fn asset_plan_watches_external_and_missing_sources_recursively() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let external = temp.path().join("assets");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = 'app'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("src/lib.rs"), "").unwrap();
+        let options = Options {
+            manifest_path: Some(project.join("Cargo.toml")),
+            assets: vec![crate::assets::Asset {
+                from: external.join("missing/images"),
+                to: None,
+            }],
+            ..Default::default()
+        };
+        let plan = WatchPlan::new(&options).unwrap();
+        assert!(
+            plan.roots
+                .iter()
+                .any(|(root, mode)| root == &external && matches!(mode, RecursiveMode::Recursive))
+        );
+        assert!(plan.relevant_path(&external.join("missing/images/icon.png")));
+        assert!(!plan.relevant_path(&project.join("dist/images/icon.png")));
     }
 
     #[test]
@@ -510,6 +567,24 @@ mod tests {
         assert!(plan.relevant(&event(
             EventKind::Create(CreateKind::File),
             plan.workspace.join("dist-source.rs")
+        )));
+    }
+
+    #[test]
+    fn external_asset_files_and_directory_contents_trigger_rebuilds() {
+        let mut plan = plan();
+        let external = plan.workspace.parent().unwrap().join("external-assets");
+        plan.assets = vec![external.join("images"), external.join("logo.svg")];
+        for path in [
+            external.join("images/nested/icon.png"),
+            external.join("images"),
+            external.join("logo.svg"),
+        ] {
+            assert!(plan.relevant(&event(EventKind::Create(CreateKind::File), path)));
+        }
+        assert!(!plan.relevant(&event(
+            EventKind::Create(CreateKind::File),
+            external.join("unrelated.txt")
         )));
     }
 

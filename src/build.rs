@@ -156,6 +156,9 @@ fn build_with(
     };
     let out_dir = package_output_directory(options, package);
     fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    // Publish generated artifacts after assets so static inputs cannot replace
+    // the freshly generated bindings, optimized WASM, or stylesheet.
+    crate::assets::copy(&options.assets, &out_dir)?;
     let output_name = wasm
         .file_stem()
         .and_then(|name| name.to_str())
@@ -699,10 +702,15 @@ mod tests {
                     quote(root.join("bindgen-args"))
                 ),
             );
+            fs::write(root.join("asset.txt"), "static asset").unwrap();
             let options = Options {
                 manifest_path: Some(root.join("Cargo.toml")),
                 release: true,
                 wasm_opt: false,
+                assets: vec![crate::assets::Asset {
+                    from: root.join("asset.txt"),
+                    to: Some("static/renamed.txt".into()),
+                }],
                 features: vec!["csr".into(), "extra".into()],
                 default_features: false,
                 ..Default::default()
@@ -723,6 +731,10 @@ mod tests {
             assert!(args.contains("custom-target/test_app.wasm\n"));
             assert!(args.contains("--target\nweb\n--no-typescript\n--out-dir\n"));
             assert!(root.join("dist").is_dir());
+            assert_eq!(
+                fs::read_to_string(root.join("dist/static/renamed.txt")).unwrap(),
+                "static asset"
+            );
             let html = fs::read_to_string(root.join("dist/index.html")).unwrap();
             assert!(html.contains("./test_app.js"));
             assert!(args.contains("--out-name\ntest_app\n"));

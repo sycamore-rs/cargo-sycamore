@@ -121,6 +121,8 @@ pub struct BuildConfig {
     pub bin: Option<String>,
     pub example: Option<String>,
     pub out_dir: Option<PathBuf>,
+    /// Config-only static files and directories to copy into the output.
+    pub assets: Vec<crate::assets::AssetConfig>,
     /// Config-only Cargo feature selection.
     pub features: Vec<String>,
     /// Config-only setting; defaults to true when omitted.
@@ -155,6 +157,7 @@ pub struct Options {
     pub example: Option<String>,
     pub out_dir: Option<PathBuf>,
     pub release: bool,
+    pub assets: Vec<crate::assets::Asset>,
     pub features: Vec<String>,
     pub default_features: bool,
     pub wasm_opt: bool,
@@ -175,6 +178,7 @@ impl Default for Options {
             example: None,
             out_dir: None,
             release: false,
+            assets: Vec::new(),
             features: Vec::new(),
             default_features: true,
             wasm_opt: true,
@@ -295,6 +299,11 @@ impl Options {
                 .map(|p| absolute(cwd, p))
                 .or_else(|| file.out_dir.as_ref().map(|p| absolute(base, p))),
             release: args.release,
+            assets: file
+                .assets
+                .into_iter()
+                .map(|asset| asset.resolve(base))
+                .collect::<Result<_>>()?,
             wasm_opt: args.wasm_opt.or(wasm_opt.enable).unwrap_or(true),
             wasm_opt_version: wasm_opt
                 .version
@@ -722,6 +731,7 @@ mod tests {
     bin = "configured-bin"
     out-dir = "output"
     features = ["csr", "extra"]
+    assets = ["images", { from = "public", to = "." }, { from = "logo.svg", to = "img/brand.svg" }]
     default-features = false
     "#,
         )
@@ -741,6 +751,13 @@ mod tests {
         assert_eq!(options.package.as_deref(), Some("cli-package"));
         assert_eq!(options.bin.as_deref(), Some("configured-bin"));
         assert_eq!(options.features, ["csr", "extra"]);
+        assert_eq!(options.assets[0].from, config_dir.join("images"));
+        assert_eq!(options.assets[1].from, config_dir.join("public"));
+        assert_eq!(options.assets[1].to.as_deref(), Some(Path::new(".")));
+        assert_eq!(
+            options.assets[2].to.as_deref(),
+            Some(Path::new("img/brand.svg"))
+        );
         assert!(!options.default_features);
         assert!(options.release);
 

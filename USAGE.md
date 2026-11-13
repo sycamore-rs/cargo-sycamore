@@ -46,7 +46,8 @@ be unified, even if only one is used by the selected app.
 Debug builds download `wasm-bindgen-cli`; release builds also download
 `wasm-opt` unless disabled. When configured, Tailwind CSS is downloaded and run
 in either mode. The command generates an HTML entrypoint and WASM web bindings,
-but does not otherwise bundle/copy CSS or other static assets. Use `serve` for the development server. Existing files in the output directory
+and copies static files/directories listed in `[build].assets` (see below).
+Use `serve` for the development server. Existing files in the output directory
 are not cleaned. Set `GITHUB_TOKEN` if needed for GitHub API
 rate limits; it is passed to the downloader for API requests only.
 
@@ -361,10 +362,40 @@ output directory and selects the release profile.
 | Binary | `--bin` | `bin` | cdylib or sole binary |
 | Example | `--example` | `example` | none |
 | Output | `--out-dir` | `out-dir` | `<package>/dist` |
+| Static assets | — | `assets` | `[]` |
 | Features | — | `features` | `[]` |
 | Default features | — | `default-features` | `true` |
 | Release profile | `--release` | — | debug |
 | Config file | `--config` | — | nearest config source |
+
+### Static assets
+
+List files or directories to copy into the output directory:
+
+```toml
+[build]
+assets = [
+    "favicon.ico",                              # dist/favicon.ico
+    "images",                                   # dist/images/ (recursive)
+    { from = "logo.svg", to = "img/brand.svg" },  # dist/img/brand.svg
+    { from = "fonts", to = "webfonts" },         # dist/webfonts/ (recursive)
+    { from = "public", to = "." },         # public/* → dist/*
+]
+```
+
+Source paths are relative to the selected config file (or the containing
+`Cargo.toml` for package metadata). Absolute source paths are also supported.
+Destinations are relative to the output directory; absolute paths, empty paths,
+and `..` components are rejected. Parent directories are created as needed.
+Using `to = "."` copies a directory’s contents directly into the output directory,
+preserving nested directories. Using `to = "."` with a file is an error.
+
+Assets are copied in array order, overwriting existing files at the same paths.
+Missing sources and copy failures are errors. Generated HTML, JavaScript, WASM,
+and Tailwind output take precedence over assets with the same names. As with other build output,
+old copied assets are not cleaned up automatically. A source directory must not
+contain the output directory. Asset changes trigger rebuilds in watch/serve mode,
+including sources outside the workspace.
 
 WASM optimization settings live under `[tools.wasm-opt]`:
 

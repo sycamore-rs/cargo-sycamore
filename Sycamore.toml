@@ -11,6 +11,13 @@
 # Config-only options:
 features = []
 default-features = true
+# Copy files/directories into the output directory (paths relative to this file).
+# assets = [
+#     "favicon.ico",
+#     "images",
+#     { from = "logo.svg", to = "img/brand.svg" },
+#     { from = "public", to = "." },
+# ]
 
 # `release` is deliberately CLI-only: use `cargo sycamore build --release`.
 
