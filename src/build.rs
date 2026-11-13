@@ -68,6 +68,7 @@ fn build_application_with(
         cargo,
         &mut ensure_tool,
         options.mode == crate::options::BuildMode::Spa,
+        server.as_deref(),
     )?;
     Ok(BuildOutput { directory, server })
 }
@@ -78,7 +79,7 @@ fn build_with(
     cargo: &OsStr,
     mut ensure_tool: impl FnMut(BuiltinTool, &str) -> Result<PathBuf>,
 ) -> Result<PathBuf> {
-    build_client_with(options, cargo, &mut ensure_tool, true)
+    build_client_with(options, cargo, &mut ensure_tool, true, None)
 }
 
 fn build_client_with(
@@ -86,6 +87,7 @@ fn build_client_with(
     cargo: &OsStr,
     mut ensure_tool: impl FnMut(BuiltinTool, &str) -> Result<PathBuf>,
     generate_shell: bool,
+    server: Option<&Path>,
 ) -> Result<PathBuf> {
     let mut metadata_command = MetadataCommand::new();
     metadata_command.cargo_path(cargo).no_deps();
@@ -199,10 +201,11 @@ fn build_client_with(
         None
     };
     let directory = package_output_directory(options, package);
-    let out_dir = directory.join("public");
+    let staging = prepare_staging(&directory, options, &metadata, &wasm, server)?;
+    let out_dir = staging.join("public");
     fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-    // Publish generated artifacts after assets so static inputs cannot replace
-    // the freshly generated bindings, optimized WASM, or stylesheet.
+    // Generate artifacts after assets so static inputs cannot replace the
+    // freshly generated bindings, optimized WASM, or stylesheet.
     crate::assets::copy(&options.assets, &out_dir)?;
     let output_name = wasm
         .file_stem()
@@ -239,7 +242,7 @@ fn build_client_with(
         None
     };
     crate::html::generate_bootstrap_and_manifest(
-        &directory,
+        &staging,
         &out_dir,
         output_name,
         stylesheet.as_deref(),
@@ -254,8 +257,116 @@ fn build_client_with(
             &options.public_url,
         )?;
     }
+    publish_staging(&directory, &staging)?;
     eprintln!("Built {} → {}", package.name, directory.display());
     Ok(directory)
+}
+
+/// Prepare a disposable generation without touching the published output.
+fn prepare_staging(
+    directory: &Path,
+    options: &Options,
+    metadata: &Metadata,
+    wasm: &Path,
+    server: Option<&Path>,
+) -> Result<PathBuf> {
+    fs::create_dir_all(directory)
+        .with_context(|| format!("creating build output directory {}", directory.display()))?;
+    let output = fs::canonicalize(directory)?;
+    // Successful publication recursively deletes the old output. Refuse paths
+    // that would consume the project, its inputs, or Cargo's build artifacts.
+    let protect = |path: &Path| -> Result<()> {
+        if let Ok(path) = fs::canonicalize(path) {
+            ensure!(
+                !path.starts_with(&output),
+                "build output directory {} contains protected input or build artifacts: {}",
+                directory.display(),
+                path.display()
+            );
+        }
+        Ok(())
+    };
+    protect(metadata.workspace_root.as_std_path())?;
+    protect(metadata.target_directory.as_std_path())?;
+    for package in metadata.workspace_packages() {
+        let project = package
+            .manifest_path
+            .parent()
+            .context("manifest has no parent")?;
+        protect(project.as_std_path())?;
+        protect(project.join("index.html").as_std_path())?;
+        let project = fs::canonicalize(project)?;
+        for target in &package.targets {
+            protect(target.src_path.as_std_path())?;
+            if let Some(source) = target.src_path.parent()
+                && let Ok(source) = fs::canonicalize(source)
+                && source != project
+            {
+                ensure!(
+                    !output.starts_with(&source),
+                    "build output directory {} is inside source directory {}",
+                    directory.display(),
+                    source.display()
+                );
+            }
+        }
+    }
+    protect(wasm)?;
+    if let Some(server) = server {
+        protect(server)?;
+    }
+    if let Some(config) = &options.config_path {
+        protect(config)?;
+    }
+    if let Some(tailwind) = &options.tailwindcss {
+        protect(&tailwind.input)?;
+    }
+    for asset in &options.assets {
+        protect(&asset.from)?;
+    }
+    let staging = directory.join(".staging");
+    remove_output_entry(&staging)?;
+    fs::create_dir(&staging)
+        .with_context(|| format!("creating staging directory {}", staging.display()))?;
+    Ok(staging)
+}
+
+/// Delete-and-copy publication deliberately happens only after generation has
+/// succeeded. This is not an atomic filesystem swap; keep staging if copying fails.
+fn publish_staging(directory: &Path, staging: &Path) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_name() != ".staging" {
+            remove_output_entry(&entry.path())?;
+        }
+    }
+    crate::assets::copy(
+        &[crate::assets::Asset {
+            from: staging.to_owned(),
+            to: Some(".".into()),
+        }],
+        directory,
+    )
+    .context("publishing staged build output")?;
+    if let Err(error) = remove_output_entry(staging) {
+        eprintln!("warning: published output but could not remove staging: {error:#}");
+    }
+    Ok(())
+}
+
+/// Do not follow output symlinks when clearing previous generations.
+fn remove_output_entry(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+    .with_context(|| format!("removing {}", path.display()))
 }
 
 fn build_server(
@@ -1010,6 +1121,7 @@ printf '%s\n' {}; fi"#,
             assert!(args.contains("custom-target/test_app.wasm\n"));
             assert!(args.contains("--target\nweb\n--no-typescript\n--out-dir\n"));
             assert!(root.join("dist").is_dir());
+            assert!(!root.join("dist/.staging").exists());
             assert_eq!(
                 fs::read_to_string(root.join("dist/public/static/renamed.txt")).unwrap(),
                 "static asset"
@@ -1060,10 +1172,8 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 output.server.as_deref(),
                 Some(root.join("custom-native/test-app").as_path())
             );
-            assert_eq!(
-                fs::read_to_string(output.directory.join("public/index.html")).unwrap(),
-                "user-owned index"
-            );
+            assert!(!output.directory.join("public/index.html").exists());
+            assert!(!output.directory.join(".staging").exists());
             let manifest: serde_json::Value = serde_json::from_slice(
                 &fs::read(output.directory.join("sycamore-assets.json")).unwrap(),
             )
@@ -1134,11 +1244,12 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 let cargo = mock_cargo_target(root, false, example.then_some("counter"));
                 fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
                 let out = root.join("custom-output");
+                let staged_module = out.join(".staging/public").join(format!("{name}_bg.wasm"));
                 let module = out.join("public").join(format!("{name}_bg.wasm"));
                 let bindgen = root.join("wasm-bindgen");
                 script(
                     &bindgen,
-                    &format!("printf 'bindgen wasm' > {}", quote(&module)),
+                    &format!("printf 'bindgen wasm' > {}", quote(&staged_module)),
                 );
                 let optimizer = root.join("wasm-opt");
                 script(
@@ -1181,10 +1292,11 @@ printf wasm > "$out/${name}_bg.wasm""#,
                         .unwrap()
                         .starts_with(&format!(
                             "{}\n-Oz\n--all-features\n--disable-compact-imports\n-o\n",
-                            module.display()
+                            staged_module.display()
                         ))
                 );
                 assert!(out.join("public/index.html").exists());
+                assert!(!out.join(".staging").exists());
                 assert_eq!(
                     fs::read_dir(out.join("public")).unwrap().count(),
                     3,
@@ -1201,13 +1313,15 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 let cargo = mock_cargo(root, false);
                 fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
                 let module = root.join("dist/public/test_app_bg.wasm");
-                if failure == "download" {
-                    fs::create_dir_all(root.join("dist/public")).unwrap();
-                    fs::write(&module, b"previous output").unwrap();
-                    fs::write(root.join("dist/public/index.html"), "previous HTML").unwrap();
-                }
+                let staged_module = root.join("dist/.staging/public/test_app_bg.wasm");
+                fs::create_dir_all(root.join("dist/public")).unwrap();
+                fs::write(&module, b"previous output").unwrap();
+                fs::write(root.join("dist/public/index.html"), "previous HTML").unwrap();
                 let bindgen = root.join("wasm-bindgen");
-                script(&bindgen, &format!("printf original > {}", quote(&module)));
+                script(
+                    &bindgen,
+                    &format!("printf original > {}", quote(&staged_module)),
+                );
                 let optimizer = root.join("wasm-opt");
                 if failure == "exit" {
                     script(&optimizer, "printf partial > \"$6\"\nexit 1");
@@ -1228,17 +1342,15 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 })
                 .unwrap_err();
                 assert!(format!("{error:#}").contains("wasm-opt"), "{error:#}");
+                assert_eq!(fs::read(&module).unwrap(), b"previous output");
+                assert_eq!(
+                    fs::read_to_string(root.join("dist/public/index.html")).unwrap(),
+                    "previous HTML"
+                );
                 if failure == "download" {
-                    assert_eq!(fs::read(&module).unwrap(), b"previous output");
-                    assert_eq!(
-                        fs::read_to_string(root.join("dist/public/index.html")).unwrap(),
-                        "previous HTML"
-                    );
-                    assert_eq!(fs::read_dir(root.join("dist/public")).unwrap().count(), 2);
+                    assert!(!staged_module.exists());
                 } else {
-                    assert_eq!(fs::read(&module).unwrap(), b"original");
-                    assert!(!root.join("dist/public/index.html").exists());
-                    assert_eq!(fs::read_dir(root.join("dist/public")).unwrap().count(), 1);
+                    assert_eq!(fs::read(&staged_module).unwrap(), b"original");
                 }
             }
         }
@@ -1318,17 +1430,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 } else {
                     "href=\"/index.css\""
                 }));
-                assert_eq!(
-                    fs::read_dir(output.parent().unwrap())
-                        .unwrap()
-                        .filter_map(Result::ok)
-                        .filter(|entry| entry
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with(".cargo-sycamore-tailwind-"))
-                        .count(),
-                    0
-                );
+                assert!(!out.join(".staging").exists());
             }
         }
 
@@ -1390,7 +1492,13 @@ printf wasm > "$out/${name}_bg.wasm""#,
                     _ => panic!("unexpected tool"),
                 })
                 .unwrap_err();
-                assert!(format!("{error:#}").contains("Tailwind CSS"), "{error:#}");
+                if failure == "overwrite-input" {
+                    let message = format!("{error:#}");
+                    assert!(message.contains("build output directory"), "{message}");
+                    assert!(message.contains("input.css"), "{message}");
+                } else {
+                    assert!(format!("{error:#}").contains("Tailwind CSS"), "{error:#}");
+                }
                 assert_eq!(
                     fs::read_to_string(&output).unwrap(),
                     if failure == "overwrite-input" {
@@ -1403,13 +1511,6 @@ printf wasm > "$out/${name}_bg.wasm""#,
                     fs::read_to_string(root.join("dist/public/index.html")).unwrap(),
                     "previous HTML"
                 );
-                assert!(!fs::read_dir(root).unwrap().any(|entry| {
-                    entry
-                        .unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(".cargo-sycamore-tailwind-")
-                }));
             }
         }
 
@@ -1451,6 +1552,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
                     .unwrap()
                     .contains("/counter.js")
             );
+            assert!(!root.join("dist/.staging").exists());
         }
 
         #[test]

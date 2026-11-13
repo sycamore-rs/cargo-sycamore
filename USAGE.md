@@ -39,12 +39,15 @@ When configured, Tailwind CSS runs as part of this client build.
 
 `[build].out-dir` is the build root and defaults to `dist/`. Browser-facing files
 (HTML when generated, JavaScript, WASM, bootstrap, stylesheet and copied assets)
-go under `dist/public/`; the private `sycamore-assets.json` manifest is beside
-that directory at `dist/sycamore-assets.json`. The build root is not a location for
-the backend executable; Cargo places the executable in its target directory.
-TypeScript declarations are disabled with wasm-bindgen's `--no-typescript` flag.
-An explicit `--out-dir` is relative to the current working directory. Custom Cargo
-target directories are supported.
+are first generated under `<out-dir>/.staging/public/`; the private manifest is
+staged at `<out-dir>/.staging/sycamore-assets.json`. After the
+client and (if configured) server builds both succeed, staged contents are
+published at the build root as `public/` and `sycamore-assets.json`, and
+`.staging/` is removed. The build root is not a location for the backend
+executable; Cargo places the executable in its target directory. TypeScript
+declarations are disabled with wasm-bindgen's `--no-typescript` flag. An explicit
+`--out-dir` is relative to the current working directory. Custom Cargo target
+directories are supported.
 
 The resulting layout is:
 
@@ -68,15 +71,25 @@ be unified, even if only one is used by the selected app.
 
 Debug builds download `wasm-bindgen-cli`; release builds also download
 `wasm-opt` unless disabled. When configured, Tailwind CSS is downloaded and run
-in either mode. The command generates browser bindings and a bootstrap under
-`public/`, plus the manifest at the build root; in SPA mode it also generates an
-HTML entrypoint under `public/`. It copies static files/directories listed in `[build].assets` into
-`public/` (see below). In SSR mode, HTML is app-owned and no build-time shell is
-generated. Use `serve` for the development server. Existing files in the output
-directory are not cleaned automatically. When upgrading to this layout, clean
-`dist/` once if needed to remove files left by the old layout. Set `GITHUB_TOKEN`
-if needed for GitHub API
-rate limits; it is passed to the downloader for API requests only.
+in either mode. The command generates browser bindings and a bootstrap in
+staging, plus the manifest; in SPA mode it also generates an HTML entrypoint. It copies static
+files/directories listed in `[build].assets` into the staged `public/` directory
+(see below). In SSR mode, HTML is app-owned and no build-time shell is generated.
+On successful publication, existing entries in `<out-dir>` other than `.staging/`
+are deleted before staged contents are copied into place. Use a dedicated output
+directory: all existing files there are discarded on success, and manual files
+are not preserved. Build guards reject output directories that would contain
+workspace/package sources or protected build inputs such as Cargo's target
+directory or a configured input/config file.
+
+Failures before publication leave previously published output untouched; a
+`.staging/` directory left by such a failure may remain until the next build resets
+it. A failure to clean staging after successful publication is reported as a warning.
+Publication itself uses delete-then-copy and is not filesystem-atomic: a
+failure during that final step can leave incomplete output. The development server
+continues serving its previous successful snapshot after a failed rebuild. Set
+`GITHUB_TOKEN` if needed for GitHub API rate limits; it is passed to the downloader
+for API requests only.
 
 ### Release WASM optimization
 
@@ -155,8 +168,9 @@ input = "styles/input.css"
   package root for source scanning. Release builds add `--minify`; debug builds do
   not. Use Tailwind's `@source` directives if you need additional scan locations.
 - Missing inputs, download errors, and compiler failures fail the build and prevent
-  successful browser reloads. CSS is published atomically, so a failed compiler
-  does not replace the previously generated stylesheet.
+  successful browser reloads. A failure before publication leaves the previous
+  output intact; the final delete-and-copy publication is not atomic and can leave
+  incomplete output if that step itself fails.
 - Watch mode tracks the configured input even outside the workspace and excludes
   generated CSS and temporary output files to prevent rebuild loops. Other files
   within the workspace also trigger compilation as usual.
@@ -177,8 +191,9 @@ output directories so watch can see edits.
 
 ### HTML entrypoint and private asset manifest
 
-In the default SPA build mode, each successful build writes `index.html` into
-`<build-root>/public/`. If an `index.html` exists beside the selected client
+In the default SPA build mode, each successful build publishes `index.html` into
+`<build-root>/public/` (it is generated in staging before publication). If an
+`index.html` exists beside the selected client
 package's `Cargo.toml`, it is used as the template; otherwise the bundled
 `templates/index.html` is used. In a workspace, this means the selected client
 package's root, not necessarily the workspace root. SSR mode deliberately skips
@@ -201,10 +216,11 @@ are supplied by the parser, and user content/scripts are preserved (formatting
 may be normalized). A previous `script[data-cargo-sycamore]` is replaced rather
 than duplicated; that marker is reserved for generated startup scripts.
 
-Every build mode also writes `<output_name>.bootstrap.js` under
+Every build mode also publishes `<output_name>.bootstrap.js` under
 `<build-root>/public/` and `sycamore-assets.json` at the build root (for example,
-`dist/sycamore-assets.json`). The manifest contains the
-fields `public_url`, `bootstrap`, `js`, and `wasm`, plus `stylesheet` when Tailwind CSS is enabled.
+`dist/sycamore-assets.json`); the manifest is staged at
+`<build-root>/.staging/sycamore-assets.json` first. It contains the fields
+`public_url`, `bootstrap`, `js`, and `wasm`, plus `stylesheet` when Tailwind CSS is enabled.
 Values are root-relative public URLs (for example, `/my_app.bootstrap.js`,
 `/my_app.js`, `/my_app_bg.wasm`, and optionally `/index.css`), never filesystem
 paths. `public_url` records the normalized deployment prefix (default `/`), and
@@ -284,7 +300,7 @@ a configured `example`. Without an example selection, normal library/binary targ
 selection is unchanged.
 
 SPA examples use the same package-root `index.html` template and default package
-`dist/` build root (with browser files under `dist/public/`) as normal builds; SSR
+`dist/` build root (with published browser files under `dist/public/`) as normal builds; SSR
 examples do not generate a shell. Use
 `--out-dir` to keep separate outputs when switching targets. `serve --example` includes watching and browser autoreload
 according to your usual serve settings.
@@ -525,8 +541,10 @@ feature sets default to `[]` and default features to `true`; the server uses the
 same `--release` selection as the client.
 
 The shared `[build]` keys are `mode`, `manifest-path`, `out-dir`, `public-url`, and `assets`.
-The `out-dir` is the build root (`dist/` by default), with browser-facing output
-under its `public/` child and `sycamore-assets.json` beside that child. All modes
+The `out-dir` is the build root (`dist/` by default). Output is staged in
+`.staging/` and published as its `public/` child plus `sycamore-assets.json` beside
+that child. Successful publication clears all other existing entries in `out-dir`;
+use a dedicated output directory and do not keep manual files there. All modes
 emit `<output_name>.bootstrap.js` and `sycamore-assets.json`; SPA also generates
 the HTML shell under `public/`, while SSR leaves HTML generation to the
 application. Static site generation/export is not performed by the tool.
@@ -575,13 +593,14 @@ empty paths, and `..` components are rejected. Parent directories are created as
 needed. Using `to = "."` copies a directory’s contents directly into `public/`,
 preserving nested directories. Using `to = "."` with a file is an error.
 
-Assets are copied in array order, overwriting existing files at the same paths.
-Missing sources and copy failures are errors. Generated HTML, JavaScript, WASM,
-and Tailwind output take precedence over assets with the same paths under
-`public/`. As with other build output, old copied assets are not cleaned up
-automatically. A source directory must not contain the output directory. Asset
-changes trigger rebuilds in watch/serve mode,
-including sources outside the workspace.
+Assets are copied in array order, overwriting existing files at the same paths
+in staged `public/`. Missing sources and copy failures are errors. Generated HTML,
+JavaScript, WASM, and Tailwind output take precedence over assets with the same
+paths under `public/`. Each successful publication clears previous output before
+copying the new staged contents, including old copied assets; no manual files in
+`out-dir` are preserved. A source directory must not contain the output directory.
+Asset changes trigger rebuilds in watch/serve mode, including sources outside the
+workspace.
 
 WASM optimization settings live under `[tools.wasm-opt]`:
 
@@ -657,7 +676,9 @@ CLI paths, including `--config`, are relative to your current working directory.
 Paths written **inside** the config are relative to the directory containing that
 file. A config file doesn't change the current project unless it sets
 `manifest-path`. Without an output override, the build root still defaults to the
-selected package's `dist/` directory, with browser files under `dist/public/`.
+selected package's `dist/` directory, with published browser files under
+`dist/public/`. Choose a dedicated output directory: successful builds remove its
+existing entries before publishing, so manual files are not retained.
 
 Unknown keys, malformed values, and CLI-only keys such as `release` in the config
 are errors. Set `default-features = false` to pass `--no-default-features` to Cargo;

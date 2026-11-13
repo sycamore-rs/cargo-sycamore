@@ -6,15 +6,18 @@
 mode = "spa"
 # Shared by client/server Cargo builds:
 # manifest-path = "Cargo.toml"
-# Build root (default dist); browser-facing files go in <out-dir>/public/,
-# while sycamore-assets.json lives beside public/ at the build root.
+# Build root (default dist); files are staged under <out-dir>/.staging/ and
+# published as <out-dir>/public/ plus <out-dir>/sycamore-assets.json after all
+# configured builds succeed. Successful publication clears all other entries in
+# this directory, so use a dedicated output directory; manual files are not kept.
 # Never a location for the native backend executable.
 # out-dir = "dist"
 # URL deployment prefix (not a filesystem subdirectory); defaults to "/".
 # public-url = "/my-app/"
 
-# Copy files/directories into <out-dir>/public/ (paths relative to this file).
-# Asset destinations (`to`) are relative to public/, not the build root.
+# Copy files/directories into staged public/ and publish under <out-dir>/public/
+# (paths relative to this file). Asset destinations (`to`) are relative to
+# public/, not the build root.
 # assets = [
 #     "favicon.ico",
 #     "images",
@@ -45,8 +48,9 @@ mode = "spa"
 # no framework integration crate is included yet.
 
 # `release` is deliberately CLI-only: use `cargo sycamore build --release`.
-# Every build emits <output_name>.bootstrap.js under <out-dir>/public/ and
-# sycamore-assets.json at <out-dir>, with root-relative public URLs for
+# Every successful build publishes <output_name>.bootstrap.js under
+# <out-dir>/public/ and sycamore-assets.json at <out-dir> (staged under
+# .staging/ first), with root-relative public URLs for
 # bootstrap/js/wasm and, when enabled, stylesheet (no /public URL prefix).
 # SPA generates an HTML shell; SSR leaves HTML (and any SSG/export) to the app.
 
