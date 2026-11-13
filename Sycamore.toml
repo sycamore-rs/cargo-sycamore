@@ -81,6 +81,7 @@ enable = true
 # Explicitly enable Tailwind for builds/watch/serve (disabled by default).
 # [tools.tailwindcss]
 # enable = true
-# input = "index.css" # Default; relative to this config file.
+# Omit input to use index.css if present, or @import "tailwindcss"; otherwise.
+# input = "index.css" # Relative to this config file; explicit inputs must exist.
 # output = "index.css" # Relative to <out-dir>/public/ (dist/public by default).
 # version = "4.3.5" # Pinned default.

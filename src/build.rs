@@ -193,11 +193,7 @@ fn build_client_with(
         None
     };
     let tailwind = if let Some(config) = &options.tailwindcss {
-        ensure!(
-            config.input.is_file(),
-            "Tailwind CSS input {} is not a file",
-            config.input.display()
-        );
+        config.input_path()?;
         Some(
             ensure_tool(BuiltinTool::TailwindCss, &config.version)
                 .context("ensuring Tailwind CSS is available")?,
@@ -586,9 +582,9 @@ fn compile_tailwind(
     release: bool,
 ) -> Result<PathBuf> {
     let output = config.output_path(out_dir)?;
-    let input = fs::canonicalize(&config.input).context("resolving Tailwind CSS input")?;
+    let input = config.input_path()?;
     ensure!(
-        fs::canonicalize(&output).ok().as_ref() != Some(&input),
+        input.is_none() || fs::canonicalize(&output).ok().as_ref() != input.as_ref(),
         "Tailwind CSS output must not overwrite its input"
     );
     let parent = output
@@ -596,28 +592,35 @@ fn compile_tailwind(
         .context("Tailwind CSS output has no parent")?;
     fs::create_dir_all(parent)
         .with_context(|| format!("creating CSS output directory {}", parent.display()))?;
-    let temporary = tempfile::Builder::new()
-        .prefix(".cargo-sycamore-tailwind-")
-        .suffix(".css")
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".cargo-sycamore-tailwind-").suffix(".css");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    let temporary = builder
         .tempfile_in(parent)
         .context("creating temporary Tailwind CSS output")?;
     let mut command = Command::new(executable);
-    command
-        .current_dir(project)
-        .arg("--input")
-        .arg(&input)
-        .arg("--output")
-        .arg(temporary.path());
+    command.current_dir(project);
+    if let Some(input) = &input {
+        command.arg("--input").arg(input);
+        crate::logging::debug(format_args!("Using Tailwind CSS input {}", input.display()));
+    } else {
+        // Tailwind's built-in default is @import "tailwindcss"; with the project
+        // as its base. No temporary source file or watcher event is needed.
+        crate::logging::debug(format_args!(
+            "Using the default Tailwind CSS import template"
+        ));
+    }
+    command.arg("--output").arg(temporary.path());
     if release {
         command.arg("--minify");
     }
     crate::logging::status(
         "Compiling",
-        format_args!(
-            "Tailwind CSS {} → {}...",
-            config.input.display(),
-            output.display()
-        ),
+        format_args!("Tailwind CSS → {}...", output.display()),
     );
     let status = command
         .status()
@@ -629,7 +632,7 @@ fn compile_tailwind(
     );
     // Keep published CSS readable like other generated static assets.
     let permissions = fs::metadata(&output)
-        .or_else(|_| fs::metadata(&input))?
+        .or_else(|_| fs::metadata(input.as_deref().unwrap_or(temporary.path())))?
         .permissions();
     fs::set_permissions(temporary.path(), permissions)?;
     temporary
@@ -1408,79 +1411,107 @@ printf wasm > "$out/${name}_bg.wasm""#,
         #[test]
         fn builds_tailwind_once_in_debug_and_release_with_expected_paths() {
             for release in [false, true] {
-                let temp = fixture();
-                let root = temp.path();
-                let cargo = mock_cargo(root, false);
-                fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
-                let input = root.join("input.css");
-                fs::write(&input, "@import 'tailwindcss';").unwrap();
-                let bindgen = root.join("wasm-bindgen");
-                script(&bindgen, "exit 0");
-                let tailwind = root.join("tailwindcss");
-                script(
-                    &tailwind,
-                    &format!(
-                        "printf '%s\\n' \"$@\" > {}\npwd > {}\n[ \"$1\" = --input ]\n[ \"$3\" = --output ]\nprintf 'body {{ color: red }}' > \"$4\"",
-                        quote(root.join("tailwind-args")),
-                        quote(root.join("tailwind-cwd"))
-                    ),
-                );
-                let out = root.join("custom-dist");
-                let explicit_output = release.then(|| PathBuf::from("assets/nested/styles.css"));
-                let output = out
-                    .join("public")
-                    .join(explicit_output.as_deref().unwrap_or(Path::new("index.css")));
-                let options = Options {
-                    manifest_path: Some(root.join("Cargo.toml")),
-                    out_dir: Some(out.clone()),
-                    release,
-                    wasm_opt: false,
-                    tailwindcss: Some(TailwindOptions {
-                        input: input.clone(),
-                        output: explicit_output,
-                        version: "test-version".into(),
-                    }),
-                    ..Default::default()
-                };
-                let mut tools = Vec::new();
-                let result = build_with(&options, cargo.as_os_str(), |tool, version| {
-                    tools.push(format!("{tool:?}:{version}"));
-                    match tool {
-                        BuiltinTool::WasmBindgenCli => Ok(bindgen.clone()),
-                        BuiltinTool::TailwindCss => Ok(tailwind.clone()),
-                        _ => panic!("unexpected tool"),
+                for input_case in [
+                    "default-existing-index",
+                    "default-missing-index",
+                    "explicit-input",
+                ] {
+                    let temp = fixture();
+                    let root = temp.path();
+                    let cargo = mock_cargo(root, false);
+                    fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
+                    let (input, input_explicit) = match input_case {
+                        "default-existing-index" => {
+                            let input = root.join("index.css");
+                            fs::write(&input, "@import 'tailwindcss';").unwrap();
+                            (input, false)
+                        }
+                        "default-missing-index" => (root.join("index.css"), false),
+                        _ => {
+                            let input = root.join("input.css");
+                            fs::write(&input, "@import 'tailwindcss';").unwrap();
+                            (input, true)
+                        }
+                    };
+                    let bindgen = root.join("wasm-bindgen");
+                    script(&bindgen, "exit 0");
+                    let tailwind = root.join("tailwindcss");
+                    script(
+                        &tailwind,
+                        &format!(
+                            "printf '%s\\n' \"$@\" > {}\npwd > {}\noutput=\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --input) [ \"$#\" -ge 2 ] || exit 1; shift ;;\n    --output) [ \"$#\" -ge 2 ] || exit 1; shift; output=$1 ;;\n    --minify) ;;\n    *) exit 1 ;;\n  esac\n  shift\ndone\n[ -n \"$output\" ] || exit 1\nprintf 'body {{ color: red }}' > \"$output\"",
+                            quote(root.join("tailwind-args")),
+                            quote(root.join("tailwind-cwd"))
+                        ),
+                    );
+                    let out = root.join("custom-dist");
+                    let explicit_output =
+                        release.then(|| PathBuf::from("assets/nested/styles.css"));
+                    let output = out
+                        .join("public")
+                        .join(explicit_output.as_deref().unwrap_or(Path::new("index.css")));
+                    let options = Options {
+                        manifest_path: Some(root.join("Cargo.toml")),
+                        out_dir: Some(out.clone()),
+                        release,
+                        wasm_opt: false,
+                        tailwindcss: Some(TailwindOptions {
+                            input: input.clone(),
+                            input_explicit,
+                            output: explicit_output,
+                            version: "test-version".into(),
+                        }),
+                        ..Default::default()
+                    };
+                    let mut tools = Vec::new();
+                    let result = build_with(&options, cargo.as_os_str(), |tool, version| {
+                        tools.push(format!("{tool:?}:{version}"));
+                        match tool {
+                            BuiltinTool::WasmBindgenCli => Ok(bindgen.clone()),
+                            BuiltinTool::TailwindCss => Ok(tailwind.clone()),
+                            _ => panic!("unexpected tool"),
+                        }
+                    })
+                    .unwrap();
+                    assert_eq!(result, out);
+                    assert_eq!(
+                        tools,
+                        ["WasmBindgenCli:0.2.100", "TailwindCss:test-version"]
+                    );
+                    assert_eq!(fs::read_to_string(&output).unwrap(), "body { color: red }");
+                    let args = fs::read_to_string(root.join("tailwind-args")).unwrap();
+                    if input_case == "default-missing-index" {
+                        assert!(!args.contains("--input\n"), "{args}");
+                        assert!(
+                            !input.exists(),
+                            "fallback must not create a source stylesheet"
+                        );
+                    } else {
+                        assert!(args.starts_with(&format!(
+                            "--input\n{}\n--output\n",
+                            fs::canonicalize(&input).unwrap().display()
+                        )));
                     }
-                })
-                .unwrap();
-                assert_eq!(result, out);
-                assert_eq!(
-                    tools,
-                    ["WasmBindgenCli:0.2.100", "TailwindCss:test-version"]
-                );
-                assert_eq!(fs::read_to_string(&output).unwrap(), "body { color: red }");
-                let args = fs::read_to_string(root.join("tailwind-args")).unwrap();
-                assert!(args.starts_with(&format!(
-                    "--input\n{}\n--output\n",
-                    fs::canonicalize(input).unwrap().display()
-                )));
-                assert_eq!(args.contains("--minify\n"), release);
-                assert!(!args.contains("--watch"));
-                assert_eq!(
-                    Path::new(
-                        fs::read_to_string(root.join("tailwind-cwd"))
-                            .unwrap()
-                            .trim()
-                    ),
-                    fs::canonicalize(root).unwrap()
-                );
-                let html = fs::read_to_string(out.join("public/index.html")).unwrap();
-                assert!(html.contains("data-cargo-sycamore-tailwind"));
-                assert!(html.contains(if release {
-                    "href=\"/assets/nested/styles.css\""
-                } else {
-                    "href=\"/index.css\""
-                }));
-                assert!(!out.join(".staging").exists());
+                    assert!(args.contains("--output\n"));
+                    assert_eq!(args.contains("--minify\n"), release);
+                    assert!(!args.contains("--watch"));
+                    assert_eq!(
+                        Path::new(
+                            fs::read_to_string(root.join("tailwind-cwd"))
+                                .unwrap()
+                                .trim()
+                        ),
+                        fs::canonicalize(root).unwrap()
+                    );
+                    let html = fs::read_to_string(out.join("public/index.html")).unwrap();
+                    assert!(html.contains("data-cargo-sycamore-tailwind"));
+                    assert!(html.contains(if release {
+                        "href=\"/assets/nested/styles.css\""
+                    } else {
+                        "href=\"/index.css\""
+                    }));
+                    assert!(!out.join(".staging").exists());
+                }
             }
         }
 
@@ -1491,6 +1522,8 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 "exit",
                 "missing-executable",
                 "missing-input",
+                "missing-explicit-index",
+                "directory-default-input",
                 "overwrite-input",
             ] {
                 let temp = fixture();
@@ -1498,12 +1531,14 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 let cargo = mock_cargo(root, false);
                 fs::write(root.join("Cargo.lock"), locked("0.2.100")).unwrap();
                 fs::create_dir_all(root.join("dist/public")).unwrap();
-                let input = if failure == "overwrite-input" {
-                    root.join("dist/public/input.css")
-                } else {
-                    root.join("input.css")
+                let input = match failure {
+                    "overwrite-input" => root.join("dist/public/input.css"),
+                    "missing-explicit-index" | "directory-default-input" => root.join("index.css"),
+                    _ => root.join("input.css"),
                 };
-                if failure != "missing-input" {
+                if failure == "directory-default-input" {
+                    fs::create_dir(&input).unwrap();
+                } else if !matches!(failure, "missing-input" | "missing-explicit-index") {
                     fs::write(&input, "source CSS").unwrap();
                 }
                 let output = if failure == "overwrite-input" {
@@ -1525,6 +1560,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
                     manifest_path: Some(root.join("Cargo.toml")),
                     tailwindcss: Some(TailwindOptions {
                         input,
+                        input_explicit: failure != "directory-default-input",
                         output: Some(
                             output
                                 .strip_prefix(root.join("dist/public"))

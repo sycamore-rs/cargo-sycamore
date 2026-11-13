@@ -180,8 +180,10 @@ input = "styles/input.css"
   if these options are set while `enable` is false or omitted. There are no
   additional CLI flags. Disabling Tailwind also removes the generated stylesheet
   link from subsequent HTML output.
-- The default input is `index.css` beside the selected config file or manifest.
-  Create the input file; for Tailwind v4, start with `@import "tailwindcss";`.
+- When `input` is omitted, `index.css` beside the selected config file or manifest
+  is used if present. If it is missing, Tailwind's built-in default stylesheet,
+  `@import "tailwindcss";`, is used without creating a source file. An explicitly
+  configured `input` must exist, even when set to `"index.css"`.
 - Input paths are relative to the config file (or metadata's `Cargo.toml`), not
   the invocation directory. Absolute input paths are preserved.
 - Output paths are always relative to the resolved `public/` directory and
@@ -196,7 +198,8 @@ input = "styles/input.css"
   examples and watch/serve rebuilds, with its working directory set to the selected
   package root for source scanning. Release builds add `--minify`; debug builds do
   not. Use Tailwind's `@source` directives if you need additional scan locations.
-- Missing inputs, download errors, and compiler failures fail the build and prevent
+- Missing explicitly configured inputs, unreadable or invalid inputs, download
+  errors, and compiler failures fail the build and prevent
   successful browser reloads. A failure before publication leaves the previous
   output intact; the final delete-and-copy publication is not atomic and can leave
   incomplete output if that step itself fails.

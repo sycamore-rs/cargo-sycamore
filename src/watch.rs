@@ -532,6 +532,7 @@ mod tests {
             manifest_path: Some(project.join("Cargo.toml")),
             tailwindcss: Some(crate::options::TailwindOptions {
                 input: external.join("input.css"),
+                input_explicit: true,
                 output: Some(PathBuf::from("assets/site.css")),
                 version: "test-version".into(),
             }),

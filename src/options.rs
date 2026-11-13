@@ -122,6 +122,8 @@ pub struct TailwindConfig {
 #[derive(Debug)]
 pub struct TailwindOptions {
     pub input: PathBuf,
+    /// Missing explicit inputs are errors; only the implicit index.css may fall back.
+    pub input_explicit: bool,
     /// Relative to the public/ directory inside the build output; defaults to index.css.
     pub output: Option<PathBuf>,
     pub version: String,
@@ -181,6 +183,22 @@ pub struct BuildConfig {
 }
 
 impl TailwindOptions {
+    pub(crate) fn input_path(&self) -> Result<Option<PathBuf>> {
+        match fs::canonicalize(&self.input) {
+            Ok(input) => {
+                ensure!(
+                    input.is_file(),
+                    "Tailwind CSS input {} is not a file",
+                    self.input.display()
+                );
+                Ok(Some(input))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound && !self.input_explicit => Ok(None),
+            Err(error) => Err(error)
+                .with_context(|| format!("resolving Tailwind CSS input {}", self.input.display())),
+        }
+    }
+
     pub(crate) fn output_path(&self, out_dir: &Path) -> Result<PathBuf> {
         let path = self.output.as_deref().unwrap_or(Path::new("index.css"));
         ensure!(
@@ -371,6 +389,7 @@ impl Options {
         }
         let tailwindcss = if tailwind.enable {
             Some(TailwindOptions {
+                input_explicit: tailwind.input.is_some(),
                 input: absolute(
                     base,
                     tailwind.input.as_deref().unwrap_or(Path::new("index.css")),
@@ -820,6 +839,7 @@ mod tests {
         for setting in [
             "",
             "input = 'styles.css'",
+            "input = 'index.css'",
             "output = 'public/app.css'",
             "version = '4.0.0'",
         ] {
@@ -834,12 +854,13 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 tailwind.input,
-                base.join(if setting.starts_with("input") {
+                base.join(if setting.contains("styles.css") {
                     "styles.css"
                 } else {
                     "index.css"
                 })
             );
+            assert_eq!(tailwind.input_explicit, setting.starts_with("input"));
             assert_eq!(
                 tailwind.output,
                 setting
@@ -894,6 +915,7 @@ mod tests {
         let options = Options::resolve_in(&BuildArgs::default(), temp.path()).unwrap();
         let tailwind = options.tailwindcss.unwrap();
         assert_eq!(tailwind.input, temp.path().join("styles.css"));
+        assert!(tailwind.input_explicit);
         assert_eq!(tailwind.output, Some(PathBuf::from("site.css")));
         assert_eq!(tailwind.version, "4.0.0");
     }
