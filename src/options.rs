@@ -96,6 +96,8 @@ pub struct Config {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ToolsConfig {
+    pub prebuild_hooks: Vec<String>,
+    pub postbuild_hooks: Vec<String>,
     pub tailwindcss: TailwindConfig,
     pub wasm_opt: WasmOptConfig,
 }
@@ -259,6 +261,8 @@ pub struct Options {
     pub cargo_flags: Vec<String>,
     pub watch_ignore: Vec<String>,
     pub watch_use_gitignore: bool,
+    pub prebuild_hooks: Vec<String>,
+    pub postbuild_hooks: Vec<String>,
     pub assets: Vec<crate::assets::Asset>,
     pub features: Vec<String>,
     pub default_features: bool,
@@ -290,6 +294,8 @@ impl Default for Options {
             cargo_flags: Vec::new(),
             watch_ignore: Vec::new(),
             watch_use_gitignore: true,
+            prebuild_hooks: Vec::new(),
+            postbuild_hooks: Vec::new(),
             assets: Vec::new(),
             features: Vec::new(),
             default_features: true,
@@ -476,6 +482,8 @@ impl Options {
             cargo_flags: args.cargo_flags(),
             watch_ignore: config.watch.ignore,
             watch_use_gitignore: config.watch.use_gitignore,
+            prebuild_hooks: config.tools.prebuild_hooks,
+            postbuild_hooks: config.tools.postbuild_hooks,
             assets: file
                 .assets
                 .into_iter()
@@ -906,6 +914,8 @@ mod tests {
             "[tools.tailwindcss]\ninput = 123",
             "[tools.tailwindcss]\nversion = 4",
             "[tools.tailwindcss]\nminfy = true",
+            "[tools]\nprebuild-hooks = 'not-an-array'",
+            "[tools]\npostbuild-hooks = [1]",
             "[tools.unknown]\ninput = 'file'",
         ] {
             assert!(toml::from_str::<Config>(invalid).is_err());
@@ -935,13 +945,15 @@ mod tests {
     #[test]
     fn tailwind_configuration_is_also_supported_in_cargo_metadata() {
         let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("Cargo.toml"), "[package]\nname = 'app'\nversion = '0.1.0'\n[package.metadata.sycamore.tools.tailwindcss]\nenable = true\ninput = 'styles.css'\noutput = 'site.css'\nversion = '4.0.0'\n").unwrap();
+        fs::write(temp.path().join("Cargo.toml"), "[package]\nname = 'app'\nversion = '0.1.0'\n[package.metadata.sycamore.tools]\nprebuild-hooks = ['echo metadata-pre', 'second pre']\npostbuild-hooks = ['echo metadata-post']\n[package.metadata.sycamore.tools.tailwindcss]\nenable = true\ninput = 'styles.css'\noutput = 'site.css'\nversion = '4.0.0'\n").unwrap();
         let options = Options::resolve_in(&BuildArgs::default(), temp.path()).unwrap();
         let tailwind = options.tailwindcss.unwrap();
         assert_eq!(tailwind.input, temp.path().join("styles.css"));
         assert!(tailwind.input_explicit);
         assert_eq!(tailwind.output, Some(PathBuf::from("site.css")));
         assert_eq!(tailwind.version, "4.0.0");
+        assert_eq!(options.prebuild_hooks, ["echo metadata-pre", "second pre"]);
+        assert_eq!(options.postbuild_hooks, ["echo metadata-post"]);
     }
 
     #[test]
@@ -1006,6 +1018,8 @@ mod tests {
         assert!(options.cargo_flags.is_empty());
         assert!(options.watch_ignore.is_empty());
         assert!(options.watch_use_gitignore);
+        assert!(options.prebuild_hooks.is_empty());
+        assert!(options.postbuild_hooks.is_empty());
         assert!(!options.release);
         assert!(options.out_dir.is_none());
         assert!(options.manifest_path.is_none());
@@ -1028,6 +1042,9 @@ mod tests {
     [watch]
     ignore = ["private/", "*.local"]
     use-gitignore = false
+    [tools]
+    prebuild-hooks = ["echo first", "echo second"]
+    postbuild-hooks = ["echo after"]
     [build.client]
     package = "configured-package"
     bin = "configured-bin"
@@ -1054,6 +1071,8 @@ mod tests {
         assert_eq!(options.public_url, "/deployment/");
         assert_eq!(options.watch_ignore, ["private/", "*.local"]);
         assert!(!options.watch_use_gitignore);
+        assert_eq!(options.prebuild_hooks, ["echo first", "echo second"]);
+        assert_eq!(options.postbuild_hooks, ["echo after"]);
         assert_eq!(options.package.as_deref(), Some("cli-package"));
         assert_eq!(options.bin.as_deref(), Some("configured-bin"));
         assert_eq!(options.features, ["csr", "extra"]);
@@ -1228,6 +1247,8 @@ use-gitignore = false
             "build = false",
             "[package.metadata.sycamore.tools.wasm-opt]\nenable = 'false'",
             "[package.metadata.sycamore.tools.wasm-opt]\nversion = 133",
+            "tools = { prebuild-hooks = 'not-an-array' }",
+            "tools = { postbuild-hooks = [1] }",
         ] {
             fs::write(&manifest, format!("[package]\nname = 'app'\nversion = '0.1.0'\n[package.metadata.sycamore]\n{metadata}\n")).unwrap();
             let error = Options::resolve_in(&BuildArgs::default(), root).unwrap_err();

@@ -79,6 +79,13 @@ use-gitignore = true
 # Additional gitignore-style patterns, relative to this config file.
 # ignore = ["generated/", "**/*.log", "scratch/*", "!scratch/keep.rs"]
 
+[tools]
+# Ordered shell commands, run once per build/watch/serve rebuild from this directory.
+# A failed command fails the build and skips later hooks.
+# prebuild-hooks = ["echo Preparing build"]
+# Postbuild hooks run after publication; their side effects are not rolled back.
+# postbuild-hooks = ["echo Build complete"]
+
 [tools.wasm-opt]
 # Optimize release builds; override with --wasm-opt=false (debug builds skip it).
 enable = true

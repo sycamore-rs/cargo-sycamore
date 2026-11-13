@@ -56,6 +56,7 @@ fn build_application_with(
     cargo: &OsStr,
     mut ensure_tool: impl FnMut(BuiltinTool, &str) -> Result<PathBuf>,
 ) -> Result<BuildOutput> {
+    run_hooks(options, "prebuild", &options.prebuild_hooks)?;
     // Compile the backend first: a failed native build must not publish a new
     // client generation over the currently served output.
     let server = options
@@ -70,7 +71,53 @@ fn build_application_with(
         options.mode == crate::options::BuildMode::Spa,
         server.as_deref(),
     )?;
+    run_hooks(options, "postbuild", &options.postbuild_hooks)?;
     Ok(BuildOutput { directory, server })
+}
+
+fn run_hooks(options: &Options, phase: &str, hooks: &[String]) -> Result<()> {
+    let directory = options
+        .config_path
+        .as_deref()
+        .or(options.manifest_path.as_deref())
+        .and_then(Path::parent)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    for (index, hook) in hooks.iter().enumerate() {
+        crate::logging::status(
+            "Running",
+            format_args!("{phase} hook {}/{}", index + 1, hooks.len()),
+        );
+        crate::logging::debug(format_args!("Hook in {}: {hook}", directory.display()));
+        #[cfg(windows)]
+        let mut command = {
+            use std::os::windows::process::CommandExt;
+            let mut command = Command::new("cmd.exe");
+            command
+                .args(["/D", "/S", "/C"])
+                .raw_arg(format!("\"{hook}\""));
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(hook);
+            command
+        };
+        let status = command.current_dir(directory).status().with_context(|| {
+            format!(
+                "running {phase} hook {} in {}: {hook}",
+                index + 1,
+                directory.display()
+            )
+        })?;
+        ensure!(
+            status.success(),
+            "{phase} hook {} failed ({status}): {hook}",
+            index + 1
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1064,7 +1111,8 @@ name = "library"
                     r#"if [ "$1" = metadata ]; then printf '%s\n' "$*" >> {}; exec {} "$@"; fi
 if [ "$1" = -vV ]; then printf 'host: x86_64-unknown-linux-gnu\n'; exit 0; fi
 printf '%s\n' "$*" >> {}
-if echo "$*" | grep -q wasm32-unknown-unknown; then printf wasm > {}; printf '%s\n' {}; else
+if echo "$*" | grep -q wasm32-unknown-unknown; then printf 'client-build\n' >> {}; printf wasm > {}; printf '%s\n' {}; else
+printf 'native-build\n' >> {}
 {}
 mkdir -p {}
 printf server > {}
@@ -1072,8 +1120,10 @@ printf '%s\n' {}; fi"#,
                     quote(root.join("metadata-args")),
                     quote(real_cargo),
                     quote(root.join("build-args")),
+                    quote(root.join("hook-sequence")),
                     quote(&client_wasm),
                     quote(client_artifact.to_string()),
+                    quote(root.join("hook-sequence")),
                     if native_fail { "exit 1" } else { "true" },
                     quote(executable.parent().unwrap()),
                     quote(&executable),
@@ -1186,7 +1236,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
             let out = root.join("dist");
             fs::create_dir_all(out.join("public")).unwrap();
             fs::write(out.join("public/index.html"), "user-owned index").unwrap();
-            let options = Options {
+            let mut options = Options {
                 manifest_path: Some(root.join("Cargo.toml")),
                 mode: crate::options::BuildMode::Ssr,
                 features: vec!["frontend".into()],
@@ -1198,9 +1248,33 @@ printf wasm > "$out/${name}_bg.wasm""#,
                     features: vec!["backend".into()],
                     default_features: false,
                 }),
+                config_path: Some(root.join("config/Sycamore.toml")),
+                prebuild_hooks: vec![
+                    format!(
+                        "test \"$PWD\" = {} && printf 'pre-one\\n' >> {}",
+                        quote(root.join("config")),
+                        quote(root.join("hook-sequence"))
+                    ),
+                    format!(
+                        "printf 'pre-two\\n' >> {}",
+                        quote(root.join("hook-sequence"))
+                    ),
+                ],
+                postbuild_hooks: vec![
+                    format!(
+                        "test -f {} && printf 'post-one\\n' >> {}",
+                        quote(out.join("sycamore-assets.json")),
+                        quote(root.join("hook-sequence"))
+                    ),
+                    format!(
+                        "printf 'post-two\\n' >> {}",
+                        quote(root.join("hook-sequence"))
+                    ),
+                ],
                 wasm_opt: false,
                 ..Default::default()
             };
+            fs::create_dir(root.join("config")).unwrap();
             let output = build_application_with(&options, cargo.as_os_str(), |tool, _| {
                 assert!(matches!(tool, BuiltinTool::WasmBindgenCli));
                 Ok(bindgen.clone())
@@ -1214,6 +1288,20 @@ printf wasm > "$out/${name}_bg.wasm""#,
             );
             assert!(!output.directory.join("public/index.html").exists());
             assert!(!output.directory.join(".staging").exists());
+            assert_eq!(
+                fs::read_to_string(root.join("hook-sequence"))
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                [
+                    "pre-one",
+                    "pre-two",
+                    "native-build",
+                    "client-build",
+                    "post-one",
+                    "post-two"
+                ]
+            );
             let manifest: serde_json::Value = serde_json::from_slice(
                 &fs::read(output.directory.join("sycamore-assets.json")).unwrap(),
             )
@@ -1246,6 +1334,26 @@ printf wasm > "$out/${name}_bg.wasm""#,
             assert!(calls[1].contains("frontend"));
             assert!(!calls[1].contains("backend"));
             assert!(!calls[1].contains("--no-default-features"));
+
+            options.prebuild_hooks.clear();
+            options.postbuild_hooks = vec![
+                format!(
+                    "test -f {} && false",
+                    quote(out.join("sycamore-assets.json"))
+                ),
+                format!(
+                    "printf 'post-remaining\\n' > {}",
+                    quote(root.join("post-remaining"))
+                ),
+            ];
+            let error =
+                build_application_with(&options, cargo.as_os_str(), |_, _| Ok(bindgen.clone()))
+                    .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("postbuild hook 1"), "{message}");
+            assert!(message.contains("exit status: 1"), "{message}");
+            assert!(out.join("sycamore-assets.json").is_file());
+            assert!(!root.join("post-remaining").exists());
         }
 
         #[test]
@@ -1266,6 +1374,14 @@ printf wasm > "$out/${name}_bg.wasm""#,
                     features: Vec::new(),
                     default_features: true,
                 }),
+                prebuild_hooks: vec![format!(
+                    "printf 'pre\\n' >> {}",
+                    quote(root.join("hook-sequence"))
+                )],
+                postbuild_hooks: vec![format!(
+                    "printf 'post\\n' >> {}",
+                    quote(root.join("hook-sequence"))
+                )],
                 ..Default::default()
             };
             let error = build_application_with(&options, cargo.as_os_str(), |_, _| {
@@ -1282,6 +1398,31 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 "previous asset"
             );
             assert_eq!(fs::read_dir(out.join("public")).unwrap().count(), 2);
+            assert_eq!(
+                fs::read_to_string(root.join("hook-sequence"))
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                ["pre", "native-build"]
+            );
+
+            for path in [root.join("build-args"), root.join("hook-sequence")] {
+                let _ = fs::remove_file(path);
+            }
+            let mut failing_pre = options;
+            failing_pre.prebuild_hooks = vec![
+                "false".into(),
+                format!("printf skipped > {}", quote(root.join("pre-remaining"))),
+            ];
+            let error = build_application_with(&failing_pre, cargo.as_os_str(), |_, _| {
+                panic!("a failed prebuild hook must prevent client tools")
+            })
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("prebuild hook 1"), "{message}");
+            assert!(message.contains("exit status: 1"), "{message}");
+            assert!(!root.join("build-args").exists());
+            assert!(!root.join("pre-remaining").exists());
         }
 
         #[test]

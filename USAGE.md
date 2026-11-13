@@ -120,6 +120,44 @@ continues serving its previous successful snapshot after a failed rebuild. Set
 `GITHUB_TOKEN` if needed for GitHub API rate limits; it is passed to the downloader
 for API requests only.
 
+### Build hooks
+
+Configure shell commands to run around each application build:
+
+```toml
+[tools]
+prebuild-hooks = ["echo Preparing build"]
+postbuild-hooks = ["echo Build complete"]
+```
+
+In Cargo metadata, use `[package.metadata.sycamore.tools]` instead. Both arrays
+are optional and default to `[]`; there are no corresponding CLI flags.
+
+- Prebuild hooks run before compiling either the native server or browser client.
+  Postbuild hooks run only after both builds and output publication succeed. Hooks
+  run once per application build, including each `watch` and `serve` rebuild, not
+  separately for the server and client.
+- Commands run sequentially, in array order, using `sh -c` on Unix or `cmd.exe /D /S /C`
+  on Windows. Shell syntax, quoting, and executable availability follow that platform.
+  Each entry uses a fresh shell, so directory or environment changes do not carry
+  over between entries. Only run hooks from trusted configurations.
+- The working directory is the selected config file's directory, including when
+  configuration comes from Cargo metadata. Without a config source, it falls back
+  to the supplied manifest's directory or the invocation directory. Commands inherit
+  the environment and stdin/stdout/stderr. Cargo flags are not automatically added
+  to commands inside hooks.
+- A command that cannot start or exits unsuccessfully fails the build and skips
+  remaining hooks. Prebuild or compilation failures skip postbuild hooks. Watch/serve
+  reports the error and waits for changes; it does not activate the new generation
+  until all postbuild hooks succeed.
+- Hook side effects are not rolled back. In particular, postbuild hooks run against
+  already-published output, so a failed postbuild hook can leave new or modified files
+  on disk even though the build is reported as failed.
+
+Hooks that write watched files can schedule further rebuilds. Avoid rewriting
+unchanged files, or exclude generated paths with `[watch].ignore` to prevent loops.
+Initial configuration and workspace discovery still happen before application hooks.
+
 ### Release WASM optimization
 
 `--release` enables `wasm-opt` by default, including in `watch`, `serve`, and
