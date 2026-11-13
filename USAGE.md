@@ -313,7 +313,15 @@ For an app deployed below the site root, set a root-relative public URL:
 public-url = "/my-app/"
 ```
 
-The default is `/`; a missing trailing slash is added automatically.
+Override this setting for `build`, `watch`, or `serve` with `--public-url`:
+
+```sh
+cargo sycamore build --public-url /my-app/
+cargo sycamore serve --public-url /preview
+```
+
+The CLI flag takes precedence over config; `--public-url /` resets the prefix to
+the site root. The default is `/`; a missing trailing slash is added automatically.
 Generated HTML imports, stylesheet links, and asset-manifest URLs use this prefix,
 for example `/my-app/my_app.js`. Generated SPA HTML also gets a
 `<base href="/my-app/">` unless the template already supplies a base element.
@@ -667,7 +675,7 @@ be nonzero and differ from the public port. See
 | Client binary | `--bin` | `build.client.bin` | cdylib or sole binary |
 | Client example | `--example` | `build.client.example` | none |
 | Output | `--out-dir` | `build.out-dir` | `<package>/dist` (build root; browser files in `public/`) |
-| Public URL prefix | — | `build.public-url` | `/` |
+| Public URL prefix | `--public-url` | `build.public-url` | `/` |
 | Static assets | — | `build.assets` | `[]` |
 | Client features | — | `build.client.features` | `[]` |
 | Client default features | — | `build.client.default-features` | `true` |

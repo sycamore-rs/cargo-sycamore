@@ -48,6 +48,9 @@ pub struct BuildArgs {
     /// Build output root; browser files go under public/ (also configurable in Sycamore.toml).
     #[arg(long, value_name = "PATH")]
     pub out_dir: Option<PathBuf>,
+    /// Root-relative deployment URL prefix (also configurable as [build].public-url).
+    #[arg(long, value_name = "URL")]
+    pub public_url: Option<String>,
     /// Explicit config file; otherwise discover Sycamore.toml or Cargo package metadata.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
@@ -434,7 +437,12 @@ impl Options {
             tailwind.output_path(Path::new("."))?;
         }
         let file = config.build;
-        let public_url = normalize_public_url(file.public_url.as_deref().unwrap_or("/"))?;
+        let public_url = normalize_public_url(
+            args.public_url
+                .as_deref()
+                .or(file.public_url.as_deref())
+                .unwrap_or("/"),
+        )?;
         ensure!(
             args.bin.is_none() || args.example.is_none(),
             "--bin and --example are mutually exclusive"
@@ -516,11 +524,11 @@ impl Options {
 fn normalize_public_url(url: &str) -> Result<String> {
     ensure!(
         url.starts_with('/') && !url.contains("//"),
-        "[build].public-url must begin with '/' and cannot contain repeated slashes"
+        "public-url must begin with '/' and cannot contain repeated slashes"
     );
     ensure!(
         !url.contains('?') && !url.contains('#'),
-        "[build].public-url cannot contain a query or fragment"
+        "public-url cannot contain a query or fragment"
     );
     ensure!(
         !url.chars().any(|ch| {
@@ -529,7 +537,7 @@ fn normalize_public_url(url: &str) -> Result<String> {
                 || ch.is_whitespace()
                 || matches!(ch, '"' | '<' | '>' | '`' | '&')
         }),
-        "[build].public-url contains an unsafe character"
+        "public-url contains an unsafe character"
     );
 
     let bytes = url.as_bytes();
@@ -540,13 +548,13 @@ fn normalize_public_url(url: &str) -> Result<String> {
                 index + 2 < bytes.len()
                     && bytes[index + 1].is_ascii_hexdigit()
                     && bytes[index + 2].is_ascii_hexdigit(),
-                "[build].public-url contains a malformed percent escape"
+                "public-url contains a malformed percent escape"
             );
             let decoded = u8::from_str_radix(&url[index + 1..index + 3], 16)
                 .expect("validated hexadecimal digits");
             ensure!(
                 !matches!(decoded, b'/' | b'\\' | 0..=0x1f | 0x7f),
-                "[build].public-url cannot percent-encode separators or control characters"
+                "public-url cannot percent-encode separators or control characters"
             );
             index += 3;
         } else {
@@ -556,27 +564,27 @@ fn normalize_public_url(url: &str) -> Result<String> {
 
     let decoded = percent_encoding::percent_decode_str(url)
         .decode_utf8()
-        .context("[build].public-url percent escapes must encode valid UTF-8")?;
+        .context("public-url percent escapes must encode valid UTF-8")?;
     ensure!(
         !decoded.chars().any(|ch| {
             ch.is_control()
                 || (ch.is_whitespace() && ch != ' ')
                 || matches!(ch, '?' | '#' | '\\' | '"' | '<' | '>' | '`')
         }),
-        "[build].public-url contains an unsafe percent-encoded character"
+        "public-url contains an unsafe percent-encoded character"
     );
     ensure!(
         !decoded
             .split('/')
             .any(|segment| segment == "." || segment == ".."),
-        "[build].public-url cannot contain dot or dot-dot path segments"
+        "public-url cannot contain dot or dot-dot path segments"
     );
     ensure!(
         decoded
             .strip_prefix('/')
             .and_then(|path| path.split('/').next())
             != Some("__sycamore"),
-        "[build].public-url cannot use the reserved __sycamore path"
+        "public-url cannot use the reserved __sycamore path"
     );
 
     let mut normalized = url.to_owned();
@@ -1090,6 +1098,7 @@ mod tests {
         let args = BuildArgs {
             manifest_path: Some(PathBuf::from("cli/Cargo.toml")),
             out_dir: Some(PathBuf::from("cli-output")),
+            public_url: Some("/cli-prefix".into()),
             bin: Some("cli-bin".into()),
             ..args
         };
@@ -1099,7 +1108,42 @@ mod tests {
             Some(temp.path().join("cli/Cargo.toml"))
         );
         assert_eq!(options.out_dir, Some(temp.path().join("cli-output")));
+        assert_eq!(options.public_url, "/cli-prefix/");
         assert_eq!(options.bin.as_deref(), Some("cli-bin"));
+
+        for (value, expected) in [
+            ("/", "/"),
+            ("/nested/app", "/nested/app/"),
+            ("/app/", "/app/"),
+        ] {
+            let args = BuildArgs {
+                config: Some(config_dir.join("Sycamore.toml")),
+                public_url: Some(value.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                Options::resolve_in(&args, temp.path()).unwrap().public_url,
+                expected
+            );
+        }
+        for value in [
+            "",
+            "relative",
+            "//host/",
+            "/app?query",
+            "/app#fragment",
+            "/../",
+            "/__sycamore/",
+        ] {
+            let args = BuildArgs {
+                public_url: Some(value.into()),
+                ..Default::default()
+            };
+            assert!(
+                Options::resolve_in(&args, temp.path()).is_err(),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

@@ -162,6 +162,8 @@ mod tests {
                 "--locked",
                 "--offline",
                 "--frozen",
+                "--public-url",
+                "/deployment/",
             ])
             .unwrap();
             let args = match cli.command {
@@ -174,6 +176,7 @@ mod tests {
             assert!(args.locked);
             assert!(args.offline);
             assert!(args.frozen);
+            assert_eq!(args.public_url.as_deref(), Some("/deployment/"));
             assert!(
                 parse(&[
                     "cargo-sycamore",
@@ -186,6 +189,7 @@ mod tests {
                 .is_err()
             );
             assert!(parse(&["cargo-sycamore", command, "--example"]).is_err());
+            assert!(parse(&["cargo-sycamore", command, "--public-url"]).is_err());
         }
     }
 

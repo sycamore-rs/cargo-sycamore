@@ -13,6 +13,7 @@ mode = "spa"
 # Never a location for the native backend executable.
 # out-dir = "dist"
 # URL deployment prefix (not a filesystem subdirectory); defaults to "/".
+# CLI override: --public-url /my-app/ (build/watch/serve).
 # public-url = "/my-app/"
 
 # Copy files/directories into staged public/ and publish under <out-dir>/public/
