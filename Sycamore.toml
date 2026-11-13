@@ -73,6 +73,12 @@ autoreload = true
 # With serve-frontend = false, all paths except /__sycamore/ dev endpoints are
 # forwarded. Explicit `spa` and nonempty `forward-routes` are rejected in backend-only mode.
 
+[watch]
+# Honor repository/nested .gitignore files during watch and serve (default true).
+use-gitignore = true
+# Additional gitignore-style patterns, relative to this config file.
+# ignore = ["generated/", "**/*.log", "scratch/*", "!scratch/keep.rs"]
+
 [tools.wasm-opt]
 # Optimize release builds; override with --wasm-opt=false (debug builds skip it).
 enable = true

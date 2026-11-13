@@ -89,6 +89,7 @@ pub struct ServeArgs {
 pub struct Config {
     pub build: BuildConfig,
     pub serve: ServeConfig,
+    pub watch: WatchConfig,
     pub tools: ToolsConfig,
 }
 
@@ -127,6 +128,23 @@ pub struct TailwindOptions {
     /// Relative to the public/ directory inside the build output; defaults to index.css.
     pub output: Option<PathBuf>,
     pub version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct WatchConfig {
+    /// Additional gitignore-style patterns, relative to the configuration source.
+    pub ignore: Vec<String>,
+    pub use_gitignore: bool,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            ignore: Vec::new(),
+            use_gitignore: true,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -239,6 +257,8 @@ pub struct Options {
     pub release: bool,
     /// CLI-only flags forwarded to every Cargo build and metadata invocation.
     pub cargo_flags: Vec<String>,
+    pub watch_ignore: Vec<String>,
+    pub watch_use_gitignore: bool,
     pub assets: Vec<crate::assets::Asset>,
     pub features: Vec<String>,
     pub default_features: bool,
@@ -268,6 +288,8 @@ impl Default for Options {
             public_url: "/".into(),
             release: false,
             cargo_flags: Vec::new(),
+            watch_ignore: Vec::new(),
+            watch_use_gitignore: true,
             assets: Vec::new(),
             features: Vec::new(),
             default_features: true,
@@ -452,6 +474,8 @@ impl Options {
             public_url,
             release: args.release,
             cargo_flags: args.cargo_flags(),
+            watch_ignore: config.watch.ignore,
+            watch_use_gitignore: config.watch.use_gitignore,
             assets: file
                 .assets
                 .into_iter()
@@ -980,6 +1004,8 @@ mod tests {
         assert!(options.default_features);
         assert!(options.features.is_empty());
         assert!(options.cargo_flags.is_empty());
+        assert!(options.watch_ignore.is_empty());
+        assert!(options.watch_use_gitignore);
         assert!(!options.release);
         assert!(options.out_dir.is_none());
         assert!(options.manifest_path.is_none());
@@ -999,6 +1025,9 @@ mod tests {
     out-dir = "output"
     public-url = "/deployment"
     assets = ["images", { from = "public", to = "." }, { from = "logo.svg", to = "img/brand.svg" }]
+    [watch]
+    ignore = ["private/", "*.local"]
+    use-gitignore = false
     [build.client]
     package = "configured-package"
     bin = "configured-bin"
@@ -1023,6 +1052,8 @@ mod tests {
         );
         assert_eq!(options.out_dir, Some(config_dir.join("output")));
         assert_eq!(options.public_url, "/deployment/");
+        assert_eq!(options.watch_ignore, ["private/", "*.local"]);
+        assert!(!options.watch_use_gitignore);
         assert_eq!(options.package.as_deref(), Some("cli-package"));
         assert_eq!(options.bin.as_deref(), Some("configured-bin"));
         assert_eq!(options.features, ["csr", "extra"]);
@@ -1109,6 +1140,9 @@ version = "133"
 port = 9001
 autoreload = false
 spa = true
+[package.metadata.sycamore.watch]
+ignore = ["generated/", "*.cache"]
+use-gitignore = false
 "#,
         )
         .unwrap();
@@ -1124,6 +1158,8 @@ spa = true
         assert_eq!(options.port, 9001);
         assert!(!options.autoreload);
         assert!(options.spa);
+        assert_eq!(options.watch_ignore, ["generated/", "*.cache"]);
+        assert!(!options.watch_use_gitignore);
         let args = BuildArgs {
             manifest_path: Some(manifest),
             out_dir: Some("cli-dist".into()),
@@ -1570,6 +1606,10 @@ backend-port = 9000
             "[build]\nout_dir = 'typo'",
             "[build.client]\ndefault-features = 'not a boolean'",
             "[unknown]\nvalue = true",
+            "[watch]\nignore = 'not-an-array'",
+            "[watch]\nignore = [1]",
+            "[watch]\nuse-gitignore = 'false'",
+            "[watch]\nuse_gitignore = false",
             "broken [toml",
         ] {
             assert!(toml::from_str::<Config>(contents).is_err(), "{contents}");

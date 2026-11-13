@@ -358,6 +358,41 @@ output directory, and `.git` paths are ignored to avoid self-triggered rebuilds.
 Use a dedicated output directory, not the workspace root. Ignored paths are not
 available as watch inputs.
 
+### Watch ignore rules
+
+Both `watch` and `serve` support additional exclusions:
+
+```toml
+[watch]
+use-gitignore = true # Default.
+ignore = ["generated/", "**/*.log", "scratch/*", "!scratch/keep.rs"]
+```
+
+The same settings can be placed under `[package.metadata.sycamore.watch]` in
+`Cargo.toml`.
+
+- `ignore` defaults to `[]`. Patterns use gitignore syntax and are relative to
+  the selected config file (or metadata's `Cargo.toml`). Directories cover their
+  descendants; globs, leading `/` anchors, and ordered `!` exceptions are supported.
+  An exception cannot restore a child of a directory that is itself ignored.
+- With `use-gitignore = true`, repository and nested `.gitignore` files are honored.
+  If the workspace is inside a Git repository, rules from its repository ancestors
+  also apply. Outside a repository, rules start at the workspace root. Global Git
+  ignores, `.git/info/exclude`, and `.ignore` files are not loaded. Rules are matched
+  directly; the Git index is not consulted to exempt already-tracked files.
+- `use-gitignore = false` disables only `.gitignore` filtering. Configured `ignore`
+  patterns and the built-in output/editor exclusions still apply.
+- Configured assets and the enabled Tailwind input stay watched even when matched
+  by `.gitignore`. The additional `ignore` patterns can exclude those inputs.
+  Negations in `ignore` only undo other configured patterns, not Git ignore rules.
+- The active config and applicable `.gitignore` files remain watched despite these
+  patterns, so edits to the rules take effect without a restart. `.gitignore` files
+  below ignored directories cannot affect watched inputs and do not trigger rebuilds.
+  Generated output directories and `.git` contents remain excluded.
+
+Ignoring paths only filters rebuild triggers; it does not exclude files from Cargo
+builds, Tailwind source scanning, or asset copying.
+
 Common editor artifacts are excluded from rebuild triggers and change logs:
 
 - Vim: `4913`, `*~`, and hidden swap files (`.*.swp` through `.*.swa`, plus `.swp`).

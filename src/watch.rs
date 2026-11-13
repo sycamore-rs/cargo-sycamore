@@ -1,5 +1,9 @@
 //! Debounced filesystem watching with serialized builds and generated-file exclusions.
 
+mod ignores;
+
+use ignores::IgnoreRules;
+
 use std::{
     collections::BTreeSet,
     path::{Component, Path, PathBuf},
@@ -173,6 +177,7 @@ struct WatchPlan {
     tailwind_input: Option<PathBuf>,
     assets: Vec<PathBuf>,
     ignored: Vec<PathBuf>,
+    ignores: IgnoreRules,
     roots: Vec<(PathBuf, RecursiveMode)>,
 }
 
@@ -217,6 +222,12 @@ impl WatchPlan {
             // Watching the parent rather than the file handles atomic-save
             // editors which replace the inode on each save.
             roots.push((parent.to_owned(), RecursiveMode::NonRecursive));
+        }
+        let ignores = IgnoreRules::new(options, &workspace)?;
+        for parent in ignores.parent_roots(&workspace) {
+            if !roots.iter().any(|(root, _)| root == &parent) {
+                roots.push((parent, RecursiveMode::NonRecursive));
+            }
         }
         let tailwind_input = options
             .tailwindcss
@@ -274,52 +285,117 @@ impl WatchPlan {
             tailwind_input,
             assets,
             ignored: ignored.into_iter().collect(),
+            ignores,
             roots,
         })
     }
 
+    #[cfg(test)]
     fn relevant(&self, event: &Event) -> bool {
-        // Backends may report queue overflow without paths; rebuild conservatively.
-        if event.need_rescan() {
-            return true;
-        }
-        if !matches!(
-            event.kind,
-            EventKind::Create(_)
-                | EventKind::Remove(_)
-                | EventKind::Modify(ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Name(_))
-                | EventKind::Any
-        ) {
-            return false;
-        }
-        event
-            .paths
-            .iter()
-            .any(|path| self.relevant_path(&normalize(path)))
+        self.collect_paths(event, &mut BTreeSet::new())
     }
 
     fn relevant_path(&self, path: &Path) -> bool {
-        self.config.as_deref() == Some(path)
-            || ((path.starts_with(&self.workspace)
-                || self.tailwind_input.as_deref() == Some(path)
-                || self.assets.iter().any(|asset| path.starts_with(asset)))
-                && !is_editor_artifact(path)
-                && !path.file_name().is_some_and(|name| {
+        self.relevant_path_kind(path, path.metadata().ok().map(|metadata| metadata.is_dir()))
+    }
+
+    fn relevant_path_kind(&self, path: &Path, is_dir: Option<bool>) -> bool {
+        if self.config.as_deref() == Some(path) {
+            return true;
+        }
+        if self.hard_ignored(path) {
+            return false;
+        }
+        if self.ignores.is_control(&self.workspace, path) {
+            return true;
+        }
+        let explicit = self
+            .tailwind_input
+            .as_deref()
+            .is_some_and(|input| input == path || input.starts_with(path))
+            || self
+                .assets
+                .iter()
+                .any(|asset| path.starts_with(asset) || asset.starts_with(path));
+        if !path.starts_with(&self.workspace) && !explicit {
+            return false;
+        }
+        let ignored = |directory| {
+            self.ignores.configured(path, directory)
+                || (!explicit && self.ignores.git(path, directory))
+        };
+        // Unknown removed/renamed entries might have been directories. Only
+        // discard them if both interpretations are ignored.
+        !match is_dir {
+            Some(directory) => ignored(directory),
+            None => ignored(false) && ignored(true),
+        }
+    }
+
+    fn hard_ignored(&self, path: &Path) -> bool {
+        self.config.as_deref() != Some(path)
+            && (is_editor_artifact(path)
+                || path.file_name().is_some_and(|name| {
                     let name = name.to_string_lossy();
                     name.starts_with(".cargo-sycamore-tailwind-") && name.ends_with(".css")
                 })
-                && !path.components().any(|part| part.as_os_str() == ".git")
-                && !self.ignored.iter().any(|ignored| path.starts_with(ignored)))
+                || path.components().any(|part| part.as_os_str() == ".git")
+                || self.ignored.iter().any(|ignored| path.starts_with(ignored)))
     }
 
-    fn collect_paths(&self, event: &Event, paths: &mut BTreeSet<PathBuf>) {
-        paths.extend(
-            event
-                .paths
-                .iter()
-                .map(|path| normalize(path))
-                .filter(|path| self.relevant_path(path)),
-        );
+    fn collect_paths(&self, event: &Event, paths: &mut BTreeSet<PathBuf>) -> bool {
+        let rescan = event.need_rescan();
+        if !rescan
+            && !matches!(
+                event.kind,
+                EventKind::Create(_)
+                    | EventKind::Remove(_)
+                    | EventKind::Modify(
+                        ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Name(_)
+                    )
+                    | EventKind::Any
+            )
+        {
+            return false;
+        }
+        let may_change_directory = match event.kind {
+            EventKind::Create(notify::event::CreateKind::File)
+            | EventKind::Remove(notify::event::RemoveKind::File) => false,
+            EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Name(_) | ModifyKind::Any)
+            | EventKind::Any => true,
+            _ => false,
+        };
+        if rescan
+            || event.paths.iter().map(|path| normalize(path)).any(|path| {
+                !self.hard_ignored(&path)
+                    && (may_change_directory
+                        || path.is_dir()
+                        || path.file_name().is_some_and(|name| name == ".gitignore"))
+            })
+        {
+            self.ignores.invalidate();
+        }
+        let directory = match event.kind {
+            EventKind::Create(notify::event::CreateKind::Folder)
+            | EventKind::Remove(notify::event::RemoveKind::Folder) => Some(true),
+            EventKind::Create(notify::event::CreateKind::File)
+            | EventKind::Remove(notify::event::RemoveKind::File) => Some(false),
+            _ => None,
+        };
+        let mut relevant = rescan;
+        for path in event.paths.iter().map(|path| normalize(path)) {
+            let matches = match directory {
+                Some(directory) => self.relevant_path_kind(&path, Some(directory)),
+                None => self.relevant_path(&path),
+            };
+            if matches {
+                relevant = true;
+                paths.insert(path);
+            }
+        }
+        relevant
     }
 }
 
@@ -358,8 +434,7 @@ fn wait_for_change(
             .recv()
             .context("filesystem watcher disconnected")?
             .context("filesystem watcher failed")?;
-        if plan.relevant(&event) {
-            plan.collect_paths(&event, &mut paths);
+        if plan.collect_paths(&event, &mut paths) {
             break;
         }
     }
@@ -372,8 +447,7 @@ fn wait_for_change(
         match receiver.recv_timeout(remaining) {
             Ok(event) => {
                 let event = event.context("filesystem watcher failed")?;
-                if plan.relevant(&event) {
-                    plan.collect_paths(&event, &mut paths);
+                if plan.collect_paths(&event, &mut paths) {
                     deadline = Instant::now() + debounce;
                 }
             }
@@ -406,6 +480,7 @@ mod tests {
 
     fn plan() -> WatchPlan {
         let root = std::env::temp_dir().join("watch-test-project");
+        let ignores = IgnoreRules::new(&Options::default(), &root).unwrap();
         WatchPlan {
             workspace: root.clone(),
             config: Some(root.join("Sycamore.toml")),
@@ -416,6 +491,7 @@ mod tests {
                 root.join("dist"),
                 root.join("custom-output"),
             ],
+            ignores,
             roots: vec![(root, RecursiveMode::Recursive)],
         }
     }
@@ -569,6 +645,166 @@ mod tests {
                 );
             }
         }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "ancestor.log\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = 'app'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+        let config_dir = root.join("config");
+        std::fs::create_dir(&config_dir).unwrap();
+        let config = config_dir.join("Sycamore.toml");
+        std::fs::write(&config, "").unwrap();
+        std::fs::write(
+            root.join(".gitignore"),
+            "*.log\n*.css\nignored-dir/\n!ignored-dir/keep.txt\nnested/*\ncached.txt\nSycamore.toml\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/.gitignore"), "*.tmp\n!important.tmp\n").unwrap();
+        let options = Options {
+            manifest_path: Some(root.join("Cargo.toml")),
+            config_path: Some(config.clone()),
+            watch_ignore: vec!["configured.txt".into(), "configured-dir/".into()],
+            assets: vec![
+                crate::assets::Asset {
+                    from: root.join("ignored.log"),
+                    to: None,
+                },
+                crate::assets::Asset {
+                    from: config_dir.join("configured.txt"),
+                    to: None,
+                },
+            ],
+            tailwindcss: Some(crate::options::TailwindOptions {
+                input: root.join("ignored.css"),
+                input_explicit: true,
+                output: None,
+                version: "test-version".into(),
+            }),
+            ..Default::default()
+        };
+        let plan = WatchPlan::new(&options).unwrap();
+        assert!(
+            options.watch_use_gitignore,
+            "gitignore watching defaults on"
+        );
+        assert!(!plan.relevant_path(&root.join("ordinary.log")));
+        assert!(
+            !plan.relevant_path(&root.join("ancestor.log")),
+            "repository ancestor gitignore applies to the workspace"
+        );
+        assert!(
+            plan.roots.iter().any(|(path, mode)| {
+                path == temp.path() && matches!(mode, RecursiveMode::NonRecursive)
+            }),
+            "repository ancestor is watched for its gitignore"
+        );
+        assert!(!plan.relevant_path(&config_dir.join("configured.txt")));
+        assert!(
+            plan.relevant_path(&root.join("configured.txt")),
+            "configured rules are relative to the config directory"
+        );
+        assert!(!plan.relevant_path(&config_dir.join("configured-dir/file.rs")));
+        assert!(!plan.relevant_path(&root.join("ignored-dir/keep.txt")));
+        assert!(!plan.relevant_path(&root.join("ignored-dir/.gitignore")));
+        assert!(!plan.relevant_path(&config_dir.join("configured-dir/.gitignore")));
+        assert!(!plan.relevant_path(&root.join("nested/ordinary.tmp")));
+        assert!(plan.relevant_path(&root.join("nested/important.tmp")));
+        assert!(
+            plan.relevant_path(&root.join("ignored.log")),
+            "explicit assets override gitignore"
+        );
+        assert!(
+            plan.relevant_path(&root.join("ignored.css")),
+            "explicit Tailwind input overrides gitignore"
+        );
+        assert!(
+            !plan.relevant_path(&config_dir.join("configured.txt")),
+            "config ignore beats explicit assets"
+        );
+        assert!(
+            plan.relevant_path(&config),
+            "the selected config is always watched"
+        );
+        assert!(
+            plan.relevant_path(&root.join(".gitignore")),
+            "ignore controls are always watched"
+        );
+        assert!(
+            plan.relevant_path(&temp.path().join(".gitignore")),
+            "ancestor ignore controls are always watched"
+        );
+        assert!(
+            !plan.relevant(&event(
+                EventKind::Remove(RemoveKind::Folder),
+                root.join("ignored-dir")
+            )),
+            "removed ignored folders retain directory-pattern semantics"
+        );
+
+        assert!(!plan.relevant_path(&root.join("cached.txt")));
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        assert!(plan.relevant(&event(
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            root.join(".gitignore")
+        )));
+        assert!(
+            plan.relevant_path(&root.join("cached.txt")),
+            "editing .gitignore invalidates cached rules"
+        );
+        std::fs::remove_file(root.join(".gitignore")).unwrap();
+        assert!(plan.relevant(&event(
+            EventKind::Remove(RemoveKind::File),
+            root.join(".gitignore")
+        )));
+        assert!(
+            plan.relevant_path(&root.join("ordinary.log")),
+            "removing .gitignore invalidates cached rules"
+        );
+        std::fs::write(root.join(".gitignore"), "created.txt\n").unwrap();
+        assert!(plan.relevant(&event(
+            EventKind::Create(CreateKind::File),
+            root.join(".gitignore")
+        )));
+        assert!(
+            !plan.relevant_path(&root.join("created.txt")),
+            "creating .gitignore invalidates cached rules"
+        );
+        let backup = root.join(".gitignore.old");
+        std::fs::rename(root.join(".gitignore"), &backup).unwrap();
+        assert!(
+            plan.relevant(
+                &Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                    .add_path(root.join(".gitignore"))
+                    .add_path(backup)
+            )
+        );
+        assert!(
+            plan.relevant_path(&root.join("created.txt")),
+            "renaming .gitignore invalidates cached rules"
+        );
+
+        let disabled = WatchPlan::new(&Options {
+            watch_use_gitignore: false,
+            ..options
+        })
+        .unwrap();
+        assert!(
+            disabled.relevant_path(&root.join("ordinary.log")),
+            "gitignore can be disabled"
+        );
+        assert!(disabled.relevant_path(&root.join("nested/ordinary.tmp")));
+        assert!(
+            !disabled.relevant_path(&config_dir.join("configured.txt")),
+            "configured ignores still apply"
+        );
     }
 
     #[test]
