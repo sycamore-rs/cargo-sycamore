@@ -15,8 +15,13 @@ const ASSET_PATH: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove
 
 /// Use the selected package's index.html, or the bundled default if absent.
 /// Writes only to the output directory and refuses to overwrite the source file.
-pub fn generate(project_root: &Path, out_dir: &Path, output_name: &str) -> Result<()> {
-    generate_with_stylesheet(project_root, out_dir, output_name, None)
+pub fn generate(
+    project_root: &Path,
+    out_dir: &Path,
+    output_name: &str,
+    public_url: &str,
+) -> Result<()> {
+    generate_with_stylesheet(project_root, out_dir, output_name, None, public_url)
 }
 
 pub(crate) fn generate_with_stylesheet(
@@ -24,6 +29,7 @@ pub(crate) fn generate_with_stylesheet(
     out_dir: &Path,
     output_name: &str,
     stylesheet: Option<&Path>,
+    public_url: &str,
 ) -> Result<()> {
     let source = project_root.join("index.html");
     let destination = out_dir.join("index.html");
@@ -44,11 +50,12 @@ pub(crate) fn generate_with_stylesheet(
                 .with_context(|| format!("reading HTML template {}", source.display()));
         }
     };
-    let html = process(&template, output_name)?;
+    let html = process(&template, output_name, public_url)?;
     let href = stylesheet
-        .map(|path| stylesheet_href(out_dir, path))
+        .map(|path| stylesheet_href(out_dir, path, public_url))
         .transpose()?;
     let html = with_stylesheet(&html, href.as_deref())?;
+    let html = with_spa_base(&html, public_url)?;
     let mut output = tempfile::NamedTempFile::new_in(out_dir)?;
     output.write_all(html.as_bytes())?;
     #[cfg(unix)]
@@ -64,8 +71,8 @@ pub(crate) fn generate_with_stylesheet(
     Ok(())
 }
 
-fn stylesheet_href(out_dir: &Path, stylesheet: &Path) -> Result<String> {
-    Ok(format!("./{}", output_url(out_dir, stylesheet)?))
+fn stylesheet_href(out_dir: &Path, stylesheet: &Path, public_url: &str) -> Result<String> {
+    Ok(format!("{public_url}{}", output_url(out_dir, stylesheet)?))
 }
 
 /// Publish the browser bootstrap under public/ and private manifest at the build root.
@@ -75,12 +82,15 @@ pub(crate) fn generate_bootstrap_and_manifest(
     public_dir: &Path,
     output_name: &str,
     stylesheet: Option<&Path>,
+    public_url: &str,
 ) -> Result<()> {
     let bootstrap_name = format!("{output_name}.bootstrap.js");
     let js = format!("{output_name}.js");
     let wasm = format!("{output_name}_bg.wasm");
     let js_url = file_url(&js);
     let bootstrap_url = file_url(&bootstrap_name);
+    let js_public_url = format!("{public_url}{js_url}");
+    let bootstrap_public_url = format!("{public_url}{bootstrap_url}");
     let bootstrap = format!(
         r#"import init from "./{js_url}";
 init().catch(error => console.error("Failed to initialize WASM:", error));
@@ -88,14 +98,15 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
     );
     let mut manifest = format!(
         r#"{{
-  "bootstrap": "/{bootstrap_url}",
-  "js": "/{js_url}",
-  "wasm": "/{}""#,
+  "bootstrap": "{bootstrap_public_url}",
+  "js": "{js_public_url}",
+  "wasm": "{public_url}{}",
+  "public_url": "{public_url}""#,
         file_url(&wasm)
     );
     if let Some(stylesheet) = stylesheet {
         manifest.push_str(&format!(
-            ",\n  \"stylesheet\": \"/{}\"",
+            ",\n  \"stylesheet\": \"{public_url}{}\"",
             output_url(public_dir, stylesheet)?
         ));
     }
@@ -152,12 +163,12 @@ fn with_stylesheet(template: &str, href: Option<&str>) -> Result<String> {
     )
 }
 
-fn process(template: &str, output_name: &str) -> Result<String> {
+fn process(template: &str, output_name: &str, public_url: &str) -> Result<String> {
     let filename = format!("{output_name}.js");
     let filename = utf8_percent_encode(&filename, ASSET_PATH);
     let script = format!(
         r#"<script type="module" data-cargo-sycamore>
-import init from "./{filename}";
+import init from "{public_url}{filename}";
 init().catch(error => console.error("Failed to initialize WASM:", error));
 </script>"#
     );
@@ -179,7 +190,7 @@ pub(crate) fn with_reload_client(template: &str, version: &str) -> Result<String
 
 /// SPA fallbacks keep root-relative asset resolution on nested browser routes.
 /// Honor an explicit user base URL; never write this change to disk.
-pub(crate) fn with_spa_base(template: &str) -> Result<String> {
+pub(crate) fn with_spa_base(template: &str, public_url: &str) -> Result<String> {
     let mut document = Html::parse_document(template);
     let base_selector = Selector::parse("head base[href]").expect("valid base selector");
     if document.select(&base_selector).next().is_none() {
@@ -189,7 +200,7 @@ pub(crate) fn with_spa_base(template: &str) -> Result<String> {
             .next()
             .context("HTML document has no head")?
             .id();
-        let fragment = Html::parse_fragment(r#"<base href="/">"#);
+        let fragment = Html::parse_fragment(&format!(r#"<base href="{public_url}">"#));
         let fragment_selector = Selector::parse("base[href]").expect("valid base selector");
         let base = fragment
             .select(&fragment_selector)
@@ -285,7 +296,7 @@ mod tests {
         fs::write(&css, "body{}").unwrap();
         let template = "<head><link rel=stylesheet href='user.css'><link rel=stylesheet href='old.css' data-cargo-sycamore-tailwind></head><body>App</body>";
         fs::write(root.join("index.html"), template).unwrap();
-        generate_with_stylesheet(root, &out, "app", Some(&css)).unwrap();
+        generate_with_stylesheet(root, &out, "app", Some(&css), "/my-app/").unwrap();
         let generated = fs::read_to_string(out.join("index.html")).unwrap();
         let document = Html::parse_document(&generated);
         assert_eq!(
@@ -296,7 +307,7 @@ mod tests {
             first(&document, "link[data-cargo-sycamore-tailwind]")
                 .value()
                 .attr("href"),
-            Some("./assets/my%20styles%20%23%25.css")
+            Some("/my-app/assets/my%20styles%20%23%25.css")
         );
         assert_eq!(
             first(&document, "link[data-cargo-sycamore-tailwind]")
@@ -307,6 +318,11 @@ mod tests {
         assert_eq!(count(&document, "link[href='user.css']"), 1);
         assert_eq!(count(&document, "link[href='old.css']"), 0);
         assert_eq!(count(&document, "script[data-cargo-sycamore]"), 1);
+        assert!(
+            text(first(&document, "script[data-cargo-sycamore]"))
+                .contains("import init from \"/my-app/app.js\"")
+        );
+        assert_eq!(count(&document, "base[href='/my-app/']"), 1);
         assert_eq!(
             fs::read_to_string(root.join("index.html")).unwrap(),
             template
@@ -319,12 +335,12 @@ mod tests {
             ),
             1
         );
-        generate(root, &out, "app").unwrap();
+        generate(root, &out, "app", "/").unwrap();
         let disabled = Html::parse_document(&fs::read_to_string(out.join("index.html")).unwrap());
         assert_eq!(count(&disabled, "link[data-cargo-sycamore-tailwind]"), 0);
         assert_eq!(count(&disabled, "link[href='user.css']"), 1);
         fs::remove_file(root.join("index.html")).unwrap();
-        generate_with_stylesheet(root, &out, "app", Some(&css)).unwrap();
+        generate_with_stylesheet(root, &out, "app", Some(&css), "/my-app/").unwrap();
         assert_eq!(
             count(
                 &Html::parse_document(&fs::read_to_string(out.join("index.html")).unwrap()),
@@ -343,7 +359,14 @@ mod tests {
         let stylesheet = out.join("assets/site styles.css");
         fs::write(&stylesheet, "body{}").unwrap();
 
-        generate_bootstrap_and_manifest(&directory, &out, "app name", Some(&stylesheet)).unwrap();
+        generate_bootstrap_and_manifest(
+            &directory,
+            &out,
+            "app name",
+            Some(&stylesheet),
+            "/my-app/",
+        )
+        .unwrap();
 
         assert_eq!(
             fs::read_to_string(out.join("app name.bootstrap.js")).unwrap(),
@@ -355,10 +378,11 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
             &fs::read_to_string(directory.join("sycamore-assets.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest["bootstrap"], "/app%20name.bootstrap.js");
-        assert_eq!(manifest["js"], "/app%20name.js");
-        assert_eq!(manifest["wasm"], "/app%20name_bg.wasm");
-        assert_eq!(manifest["stylesheet"], "/assets/site%20styles.css");
+        assert_eq!(manifest["bootstrap"], "/my-app/app%20name.bootstrap.js");
+        assert_eq!(manifest["js"], "/my-app/app%20name.js");
+        assert_eq!(manifest["wasm"], "/my-app/app%20name_bg.wasm");
+        assert_eq!(manifest["stylesheet"], "/my-app/assets/site%20styles.css");
+        assert_eq!(manifest["public_url"], "/my-app/");
         assert!(!manifest.to_string().contains(out.to_str().unwrap()));
     }
 
@@ -371,7 +395,7 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
         let glue = b"// wasm-bindgen generated glue";
         fs::write(public.join("sycamore.js"), glue).unwrap();
 
-        generate_bootstrap_and_manifest(out, &public, "sycamore", None).unwrap();
+        generate_bootstrap_and_manifest(out, &public, "sycamore", None, "/").unwrap();
 
         assert_eq!(fs::read(public.join("sycamore.js")).unwrap(), glue);
         assert!(public.join("sycamore.bootstrap.js").is_file());
@@ -388,14 +412,15 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
         fs::create_dir(&out).unwrap();
         let css = temp.path().join("outside.css");
         fs::write(&css, "body{}").unwrap();
-        let error = generate_with_stylesheet(temp.path(), &out, "app", Some(&css)).unwrap_err();
+        let error =
+            generate_with_stylesheet(temp.path(), &out, "app", Some(&css), "/").unwrap_err();
         assert!(format!("{error:#}").contains("invalid generated stylesheet path"));
         assert!(!out.join("index.html").exists());
     }
 
     #[test]
     fn injects_reload_client_only_into_served_html_and_replaces_previous_client() {
-        let built = process(DEFAULT_HTML, "app").unwrap();
+        let built = process(DEFAULT_HTML, "app", "/").unwrap();
         assert!(!built.contains("/__sycamore/reload"));
         let served = with_reload_client(&built, "session-1").unwrap();
         let served = with_reload_client(&served, "session-2").unwrap();
@@ -425,11 +450,11 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
     #[test]
     fn spa_base_is_prepended_and_respects_existing_base() {
         let source = "<head><script type=module>import './app.js';</script></head><body>App</body>";
-        let html = with_spa_base(source).unwrap();
+        let html = with_spa_base(source, "/my-app/").unwrap();
         let document = Html::parse_document(&html);
         assert_eq!(
             first(&document, "head base").value().attr("href"),
-            Some("/")
+            Some("/my-app/")
         );
         assert_eq!(
             first(&document, "head")
@@ -440,9 +465,9 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
                 .name(),
             "base"
         );
-        let html = with_spa_base(&html).unwrap();
+        let html = with_spa_base(&html, "/my-app/").unwrap();
         assert_eq!(count(&Html::parse_document(&html), "base[href]"), 1);
-        let html = with_spa_base("<head><base href='/custom/'></head>").unwrap();
+        let html = with_spa_base("<head><base href='/custom/'></head>", "/my-app/").unwrap();
         let document = Html::parse_document(&html);
         assert_eq!(count(&document, "base[href]"), 1);
         assert_eq!(
@@ -453,17 +478,17 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
 
     #[test]
     fn default_template_has_a_module_in_head() {
-        let html = process(DEFAULT_HTML, "my_app").unwrap();
+        let html = process(DEFAULT_HTML, "my_app", "/").unwrap();
         let document = Html::parse_document(&html);
         let script = first(&document, "head script[type=module][data-cargo-sycamore]");
-        assert!(text(script).contains("import init from \"./my_app.js\""));
+        assert!(text(script).contains("import init from \"/my_app.js\""));
         assert!(text(script).contains("init().catch("));
         assert_eq!(count(&document, "meta[charset]"), 1);
     }
 
     #[test]
     fn preserves_custom_html_and_adds_an_implicit_head() {
-        let html = process("<!doctype html><HTML><BODY><main id=app>Hello</main><script src=custom.js></script></BODY></HTML>", "app").unwrap();
+        let html = process("<!doctype html><HTML><BODY><main id=app>Hello</main><script src=custom.js></script></BODY></HTML>", "app", "/").unwrap();
         let document = Html::parse_document(&html);
         assert_eq!(text(first(&document, "main#app")), "Hello");
         assert_eq!(count(&document, "head script[data-cargo-sycamore]"), 1);
@@ -472,12 +497,12 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
 
     #[test]
     fn replaces_previous_generated_script_without_touching_user_scripts() {
-        let html = process("<head><!-- </head> --><title>Custom</title><script>window.user = true;</script></head>", "old").unwrap();
-        let html = process(&html, "new").unwrap();
+        let html = process("<head><!-- </head> --><title>Custom</title><script>window.user = true;</script></head>", "old", "/").unwrap();
+        let html = process(&html, "new", "/").unwrap();
         let document = Html::parse_document(&html);
         assert_eq!(count(&document, "script[data-cargo-sycamore]"), 1);
         assert_eq!(count(&document, "head script"), 2);
-        assert!(text(first(&document, "head script[data-cargo-sycamore]")).contains("./new.js"));
+        assert!(text(first(&document, "head script[data-cargo-sycamore]")).contains("/new.js"));
         assert_eq!(text(first(&document, "title")), "Custom");
         assert!(html.contains("<!-- </head> -->"));
         assert!(html.contains("window.user = true;"));
@@ -485,7 +510,7 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
 
     #[test]
     fn preserves_doctype_templates_and_raw_script_contents() {
-        let html = process(r#"<!doctype html><head><style>body > main { color: red; }</style><script>if (1 < 2 && 3 > 2) window.message = "<&>";</script></head><body><template><span>A &amp; B</span></template></body>"#, "app").unwrap();
+        let html = process(r#"<!doctype html><head><style>body > main { color: red; }</style><script>if (1 < 2 && 3 > 2) window.message = "<&>";</script></head><body><template><span>A &amp; B</span></template></body>"#, "app", "/").unwrap();
         let document = Html::parse_document(&html);
         assert!(html.starts_with("<!DOCTYPE html>"));
         assert_eq!(
@@ -501,7 +526,7 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
 
     #[test]
     fn encodes_asset_names_so_they_cannot_escape_the_script() {
-        let html = process(DEFAULT_HTML, "app\"</script><script>alert(1)</script>").unwrap();
+        let html = process(DEFAULT_HTML, "app\"</script><script>alert(1)</script>", "/").unwrap();
         let document = Html::parse_document(&html);
         assert_eq!(count(&document, "script"), 1);
         assert!(text(first(&document, "script")).contains("%22%3C%2Fscript%3E"));
@@ -515,16 +540,16 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
         fs::create_dir(&out).unwrap();
         let custom = "<title>Custom app</title><main>Hello</main>";
         fs::write(root.join("index.html"), custom).unwrap();
-        generate(root, &out, "app").unwrap();
+        generate(root, &out, "app", "/").unwrap();
         assert!(
             fs::read_to_string(out.join("index.html"))
                 .unwrap()
                 .contains("Custom app")
         );
         assert_eq!(fs::read_to_string(root.join("index.html")).unwrap(), custom);
-        assert!(generate(root, root, "app").is_err());
+        assert!(generate(root, root, "app", "/").is_err());
         fs::remove_file(root.join("index.html")).unwrap();
-        generate(root, &out, "app").unwrap();
+        generate(root, &out, "app", "/").unwrap();
         assert!(
             fs::read_to_string(out.join("index.html"))
                 .unwrap()
@@ -536,6 +561,6 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
     fn does_not_hide_template_read_errors() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("index.html")).unwrap();
-        assert!(generate(temp.path(), temp.path(), "app").is_err());
+        assert!(generate(temp.path(), temp.path(), "app", "/").is_err());
     }
 }

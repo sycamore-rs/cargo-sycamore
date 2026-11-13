@@ -190,7 +190,7 @@ JavaScript and initialize WASM automatically:
 
 ```html
 <script type="module" data-cargo-sycamore>
-import init from "./my_app.js";
+import init from "/my_app.js";
 init().catch(error => console.error("Failed to initialize WASM:", error));
 </script>
 ```
@@ -204,10 +204,11 @@ than duplicated; that marker is reserved for generated startup scripts.
 Every build mode also writes `<output_name>.bootstrap.js` under
 `<build-root>/public/` and `sycamore-assets.json` at the build root (for example,
 `dist/sycamore-assets.json`). The manifest contains the
-fields `bootstrap`, `js`, and `wasm`, plus `stylesheet` when Tailwind CSS is enabled.
+fields `public_url`, `bootstrap`, `js`, and `wasm`, plus `stylesheet` when Tailwind CSS is enabled.
 Values are root-relative public URLs (for example, `/my_app.bootstrap.js`,
 `/my_app.js`, `/my_app_bg.wasm`, and optionally `/index.css`), never filesystem
-paths. The `bootstrap` value points to the generated bootstrap filename, which is
+paths. `public_url` records the normalized deployment prefix (default `/`), and
+all asset URLs include it. The `bootstrap` value points to the generated bootstrap filename, which is
 derived from the client artifact name to avoid colliding with wasm-bindgen output.
 The bootstrap imports the client JS and initializes WASM. SSR applications can
 read this manifest to emit their own HTML and asset links.
@@ -216,6 +217,41 @@ The SPA source template is never overwritten. Choosing an output path that would
 overwrite it produces an error. Changes to the client package's `index.html`,
 including its creation or deletion, trigger regeneration in watch mode. Serve
 browser output using HTTP rather than opening it as a `file://` URL.
+
+### Deployment prefix
+
+For an app deployed below the site root, set a root-relative public URL:
+
+```toml
+[build]
+public-url = "/my-app/"
+```
+
+The default is `/`; a missing trailing slash is added automatically.
+Generated HTML imports, stylesheet links, and asset-manifest URLs use this prefix,
+for example `/my-app/my_app.js`. Generated SPA HTML also gets a
+`<base href="/my-app/">` unless the template already supplies a base element.
+The bootstrap's own imports remain module-relative, so wasm-bindgen can resolve
+its JS, WASM, and auxiliary files under the same prefix.
+
+This changes URLs, not the filesystem layout: files still live directly under
+`dist/public/`, not `dist/public/my-app/`. Links and URLs in copied files or
+custom application code are not rewritten.
+
+When serving the frontend, the development server mounts `public/` at that prefix.
+Requests outside it return 404 unless matched by `forward-routes`; the bare
+`/my-app` redirects to `/my-app/`, preserving the query string. SPA history
+fallback stays within the prefix. Forwarded requests retain their original paths:
+forward routes are expressed against the full browser-facing path and do not
+automatically gain the prefix. Reload endpoints remain at `/__sycamore/*`.
+
+With `serve-frontend = false`, the backend still owns all routing. It must serve
+its public assets at the prefix recorded in the manifest; the proxy does not
+strip that prefix. Production hosting must mount `public/` the same way.
+
+Only root-relative deployment paths are supported, not absolute/CDN URLs.
+Queries, fragments, traversal components, repeated slashes, and unsafe or
+malformed escapes are rejected.
 
 ### Running Cargo examples
 
@@ -396,7 +432,8 @@ Autoreload defaults to `true`; `[serve].autoreload = false` disables browser
 reloads while watching and rebuilding continues. Override with `--autoreload`,
 `--autoreload=true`, or `--autoreload=false`. `[serve].spa` defaults to `false`
 (and `--spa` / `--spa=false` overrides it). SPA fallback handles missing GET/HEAD
-paths via public `index.html`, after route forwarding, and adds `<base href="/">`
+paths within `build.public-url` via public `index.html`, after route forwarding,
+and adds a `<base>` element using that prefix
 to the response if needed. Existing files and directory indexes take precedence;
 reserved endpoints do not fall back. These settings and `serve-frontend`,
 `backend-port`, and `forward-routes` can be reloaded when configuration changes.
@@ -487,7 +524,7 @@ host in a separate Cargo invocation, not into the public output directory. Both
 feature sets default to `[]` and default features to `true`; the server uses the
 same `--release` selection as the client.
 
-The shared `[build]` keys `manifest-path`, `out-dir`, and `assets` remain shared.
+The shared `[build]` keys are `mode`, `manifest-path`, `out-dir`, `public-url`, and `assets`.
 The `out-dir` is the build root (`dist/` by default), with browser-facing output
 under its `public/` child and `sycamore-assets.json` beside that child. All modes
 emit `<output_name>.bootstrap.js` and `sycamore-assets.json`; SPA also generates
@@ -507,6 +544,7 @@ be nonzero and differ from the public port. See
 | Client binary | `--bin` | `build.client.bin` | cdylib or sole binary |
 | Client example | `--example` | `build.client.example` | none |
 | Output | `--out-dir` | `build.out-dir` | `<package>/dist` (build root; browser files in `public/`) |
+| Public URL prefix | — | `build.public-url` | `/` |
 | Static assets | — | `build.assets` | `[]` |
 | Client features | — | `build.client.features` | `[]` |
 | Client default features | — | `build.client.default-features` | `true` |

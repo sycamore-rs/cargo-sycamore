@@ -151,6 +151,8 @@ pub struct BuildConfig {
     pub server: Option<ServerBuildConfig>,
     pub manifest_path: Option<PathBuf>,
     pub out_dir: Option<PathBuf>,
+    /// Root-relative deployment path used as the browser-visible public base.
+    pub public_url: Option<String>,
     /// Config-only static files and directories to copy into the output.
     pub assets: Vec<crate::assets::AssetConfig>,
 }
@@ -191,6 +193,8 @@ pub struct Options {
     pub bin: Option<String>,
     pub example: Option<String>,
     pub out_dir: Option<PathBuf>,
+    /// Normalized root-relative deployment path, with a trailing slash.
+    pub public_url: String,
     pub release: bool,
     pub assets: Vec<crate::assets::Asset>,
     pub features: Vec<String>,
@@ -218,6 +222,7 @@ impl Default for Options {
             bin: None,
             example: None,
             out_dir: None,
+            public_url: "/".into(),
             release: false,
             assets: Vec::new(),
             features: Vec::new(),
@@ -356,6 +361,7 @@ impl Options {
             tailwind.output_path(Path::new("."))?;
         }
         let file = config.build;
+        let public_url = normalize_public_url(file.public_url.as_deref().unwrap_or("/"))?;
         ensure!(
             args.bin.is_none() || args.example.is_none(),
             "--bin and --example are mutually exclusive"
@@ -398,6 +404,7 @@ impl Options {
                 .as_ref()
                 .map(|p| absolute(cwd, p))
                 .or_else(|| file.out_dir.as_ref().map(|p| absolute(base, p))),
+            public_url,
             release: args.release,
             assets: file
                 .assets
@@ -426,6 +433,79 @@ impl Options {
             spa_explicit,
         })
     }
+}
+
+fn normalize_public_url(url: &str) -> Result<String> {
+    ensure!(
+        url.starts_with('/') && !url.contains("//"),
+        "[build].public-url must begin with '/' and cannot contain repeated slashes"
+    );
+    ensure!(
+        !url.contains('?') && !url.contains('#'),
+        "[build].public-url cannot contain a query or fragment"
+    );
+    ensure!(
+        !url.chars().any(|ch| {
+            ch == '\\'
+                || ch.is_control()
+                || ch.is_whitespace()
+                || matches!(ch, '"' | '<' | '>' | '`' | '&')
+        }),
+        "[build].public-url contains an unsafe character"
+    );
+
+    let bytes = url.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            ensure!(
+                index + 2 < bytes.len()
+                    && bytes[index + 1].is_ascii_hexdigit()
+                    && bytes[index + 2].is_ascii_hexdigit(),
+                "[build].public-url contains a malformed percent escape"
+            );
+            let decoded = u8::from_str_radix(&url[index + 1..index + 3], 16)
+                .expect("validated hexadecimal digits");
+            ensure!(
+                !matches!(decoded, b'/' | b'\\' | 0..=0x1f | 0x7f),
+                "[build].public-url cannot percent-encode separators or control characters"
+            );
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+
+    let decoded = percent_encoding::percent_decode_str(url)
+        .decode_utf8()
+        .context("[build].public-url percent escapes must encode valid UTF-8")?;
+    ensure!(
+        !decoded.chars().any(|ch| {
+            ch.is_control()
+                || (ch.is_whitespace() && ch != ' ')
+                || matches!(ch, '?' | '#' | '\\' | '"' | '<' | '>' | '`')
+        }),
+        "[build].public-url contains an unsafe percent-encoded character"
+    );
+    ensure!(
+        !decoded
+            .split('/')
+            .any(|segment| segment == "." || segment == ".."),
+        "[build].public-url cannot contain dot or dot-dot path segments"
+    );
+    ensure!(
+        decoded
+            .strip_prefix('/')
+            .and_then(|path| path.split('/').next())
+            != Some("__sycamore"),
+        "[build].public-url cannot use the reserved __sycamore path"
+    );
+
+    let mut normalized = url.to_owned();
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    Ok(normalized)
 }
 
 fn validate_route_prefix(route: &str) -> Result<()> {
@@ -850,6 +930,7 @@ mod tests {
         assert!(!options.release);
         assert!(options.out_dir.is_none());
         assert!(options.manifest_path.is_none());
+        assert_eq!(options.public_url, "/");
     }
 
     #[test]
@@ -863,6 +944,7 @@ mod tests {
     [build]
     manifest-path = "app/Cargo.toml"
     out-dir = "output"
+    public-url = "/deployment"
     assets = ["images", { from = "public", to = "." }, { from = "logo.svg", to = "img/brand.svg" }]
     [build.client]
     package = "configured-package"
@@ -884,6 +966,7 @@ mod tests {
             Some(config_dir.join("app/Cargo.toml"))
         );
         assert_eq!(options.out_dir, Some(config_dir.join("output")));
+        assert_eq!(options.public_url, "/deployment/");
         assert_eq!(options.package.as_deref(), Some("cli-package"));
         assert_eq!(options.bin.as_deref(), Some("configured-bin"));
         assert_eq!(options.features, ["csr", "extra"]);
@@ -957,6 +1040,7 @@ version = "0.1.0"
 anything = true
 [package.metadata.sycamore.build]
 out-dir = "web-dist"
+public-url = "/metadata-app/"
 [package.metadata.sycamore.build.client]
 bin = "app"
 features = ["csr"]
@@ -974,6 +1058,7 @@ spa = true
         let options = Options::resolve_in(&BuildArgs::default(), &cwd).unwrap();
         assert_eq!(options.config_path, Some(manifest.clone()));
         assert_eq!(options.out_dir, Some(root.join("web-dist")));
+        assert_eq!(options.public_url, "/metadata-app/");
         assert_eq!(options.bin.as_deref(), Some("app"));
         assert_eq!(options.features, ["csr"]);
         assert!(!options.default_features);

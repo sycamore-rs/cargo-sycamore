@@ -10,6 +10,8 @@ mode = "spa"
 # while sycamore-assets.json lives beside public/ at the build root.
 # Never a location for the native backend executable.
 # out-dir = "dist"
+# URL deployment prefix (not a filesystem subdirectory); defaults to "/".
+# public-url = "/my-app/"
 
 # Copy files/directories into <out-dir>/public/ (paths relative to this file).
 # Asset destinations (`to`) are relative to public/, not the build root.

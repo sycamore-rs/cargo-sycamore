@@ -243,6 +243,7 @@ fn build_client_with(
         &out_dir,
         output_name,
         stylesheet.as_deref(),
+        &options.public_url,
     )?;
     if generate_shell {
         crate::html::generate_with_stylesheet(
@@ -250,6 +251,7 @@ fn build_client_with(
             &out_dir,
             output_name,
             stylesheet.as_deref(),
+            &options.public_url,
         )?;
     }
     eprintln!("Built {} → {}", package.name, directory.display());
@@ -1013,7 +1015,7 @@ printf '%s\n' {}; fi"#,
                 "static asset"
             );
             let html = fs::read_to_string(root.join("dist/public/index.html")).unwrap();
-            assert!(html.contains("./test_app.js"));
+            assert!(html.contains("/test_app.js"));
             assert!(args.contains("--out-name\ntest_app\n"));
         }
 
@@ -1312,9 +1314,9 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 let html = fs::read_to_string(out.join("public/index.html")).unwrap();
                 assert!(html.contains("data-cargo-sycamore-tailwind"));
                 assert!(html.contains(if release {
-                    "href=\"./assets/nested/styles.css\""
+                    "href=\"/assets/nested/styles.css\""
                 } else {
-                    "href=\"./index.css\""
+                    "href=\"/index.css\""
                 }));
                 assert_eq!(
                     fs::read_dir(output.parent().unwrap())
@@ -1447,7 +1449,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
             assert!(
                 fs::read_to_string(root.join("dist/public/index.html"))
                     .unwrap()
-                    .contains("./counter.js")
+                    .contains("/counter.js")
             );
         }
 

@@ -72,12 +72,13 @@ async fn serve_async(args: ServeArgs, options: Options, directory: PathBuf) -> R
     let shutdown_watch = Arc::clone(&shutdown);
     let app = router(Arc::clone(&state));
     eprintln!(
-        "Serving {} at http://{address} (Ctrl-C to stop)",
+        "Serving {} at http://{address}{} (Ctrl-C to stop)",
         state
             .root
             .read()
             .map_err(|_| anyhow!("server directory lock poisoned"))?
-            .display()
+            .display(),
+        options.public_url
     );
 
     let (sender, stopped) = oneshot::channel();
@@ -179,6 +180,7 @@ struct ServeConfiguration {
     serve_frontend: bool,
     backend_port: Option<u16>,
     forward_routes: Vec<String>,
+    public_url: String,
     spa: bool,
     autoreload: bool,
 }
@@ -189,6 +191,7 @@ impl From<&Options> for ServeConfiguration {
             serve_frontend: options.serve_frontend,
             backend_port: options.backend_port,
             forward_routes: options.forward_routes.clone(),
+            public_url: options.public_url.clone(),
             spa: options.spa,
             autoreload: options.autoreload,
         }
@@ -266,6 +269,7 @@ impl ServerState {
                 serve_frontend: true,
                 backend_port: None,
                 forward_routes: Vec::new(),
+                public_url: "/".into(),
                 spa: self.spa,
                 autoreload: self.autoreload,
             })
@@ -503,6 +507,32 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
         )
             .into_response();
     }
+    let decoded = match routing_path(request.uri().path()) {
+        Ok(path) => path,
+        Err(status) => return status.into_response(),
+    };
+    let prefix = percent_decode_str(&configuration.public_url)
+        .decode_utf8()
+        .expect("validated public URL");
+    let mount = prefix.trim_end_matches('/');
+    if !mount.is_empty() && decoded == mount {
+        let location = match request.uri().query() {
+            Some(query) => format!("{}?{query}", configuration.public_url),
+            None => configuration.public_url.clone(),
+        };
+        return (
+            StatusCode::PERMANENT_REDIRECT,
+            [(header::LOCATION, location)],
+        )
+            .into_response();
+    }
+    let relative = match decoded
+        .strip_prefix(mount)
+        .filter(|path| path.starts_with('/'))
+    {
+        Some(path) => path,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
     // Capture the revision before reading HTML. A build between this snapshot
     // and the WebSocket handshake is detected by the client's initial version.
     // Hold this generation alive for the whole request, even if another build
@@ -521,7 +551,7 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     };
-    let (path, spa_fallback) = match resolve_file(&directory, request.uri().path()).await {
+    let (path, spa_fallback) = match resolve_decoded_file(&directory, relative).await {
         Ok(path) => (path, false),
         Err(StatusCode::NOT_FOUND)
             if configuration.spa && !proxy::matches_route(request.uri().path(), "/__sycamore") =>
@@ -542,7 +572,7 @@ async fn static_file(State(state): State<Arc<ServerState>>, request: Request) ->
         };
         let html = (|| -> Result<String> {
             let template = if spa_fallback {
-                html::with_spa_base(&template)?
+                html::with_spa_base(&template, &configuration.public_url)?
             } else {
                 template
             };
@@ -584,6 +614,13 @@ async fn resolve_file(root: &Path, url: &str) -> std::result::Result<PathBuf, St
     let decoded = percent_decode_str(url)
         .decode_utf8()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+    resolve_decoded_file(root, &decoded).await
+}
+
+async fn resolve_decoded_file(
+    root: &Path,
+    decoded: &str,
+) -> std::result::Result<PathBuf, StatusCode> {
     if !decoded.starts_with('/') || decoded.contains(['\\', ':', '\0']) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -675,6 +712,7 @@ mod tests {
             serve_frontend,
             backend_port: Some(backend_port),
             forward_routes: vec!["/api".into()],
+            public_url: "/".into(),
             spa: true,
             autoreload,
         });
@@ -1068,8 +1106,13 @@ mod tests {
         for autoreload in [false, true] {
             let mut state = ServerState::new(temp.path().to_owned(), 8080, autoreload);
             state.spa = true;
+            let configuration = ServeConfiguration {
+                public_url: "/my-app/".into(),
+                ..state.configuration()
+            };
+            *state.configuration.get_mut().unwrap() = Some(configuration);
             let app = router(Arc::new(state));
-            let response = request(&app, Method::GET, "/users/profile?tab=1").await;
+            let response = request(&app, Method::GET, "/my-app/users/profile?tab=1").await;
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
             assert!(
@@ -1081,24 +1124,24 @@ mod tests {
             let length = response.headers()[header::CONTENT_LENGTH].clone();
             let html = text(response).await;
             assert!(html.contains("App shell"));
-            assert!(html.contains("<base href=\"/\">"));
+            assert!(html.contains("<base href=\"/my-app/\">"));
             assert_eq!(html.contains("data-cargo-sycamore-reload"), autoreload);
-            let head = request(&app, Method::HEAD, "/users/profile").await;
+            let head = request(&app, Method::HEAD, "/my-app/users/profile").await;
             assert_eq!(head.status(), StatusCode::OK);
             assert_eq!(head.headers()[header::CONTENT_LENGTH], length);
             assert!(text(head).await.is_empty());
             assert_eq!(
-                text(request(&app, Method::GET, "/app.js").await).await,
+                text(request(&app, Method::GET, "/my-app/app.js").await).await,
                 "export default 1;"
             );
             assert!(
-                text(request(&app, Method::GET, "/nested/").await)
+                text(request(&app, Method::GET, "/my-app/nested/").await)
                     .await
                     .contains("Real nested page")
             );
             assert_eq!(
                 request(&app, Method::GET, "/missing.js").await.status(),
-                StatusCode::OK
+                StatusCode::NOT_FOUND
             );
             assert_eq!(
                 request(&app, Method::GET, "/__sycamore/missing")
