@@ -95,6 +95,7 @@ fn build_client_with(
         metadata_command.manifest_path(manifest);
     }
     let metadata = metadata_command
+        .other_options(options.cargo_flags.clone())
         .exec()
         .context("reading Cargo project metadata")?;
     let package = select_package(&metadata, options.package.as_deref())?;
@@ -109,7 +110,8 @@ fn build_client_with(
         .arg(package.name.as_str())
         .arg("--target")
         .arg(WASM_TARGET)
-        .arg("--message-format=json-render-diagnostics");
+        .arg("--message-format=json-render-diagnostics")
+        .args(&options.cargo_flags);
     if target.is_example() {
         command.arg("--example").arg(&target.name);
     } else if target.is_bin() {
@@ -396,6 +398,7 @@ fn build_server(
         metadata_command.manifest_path(manifest);
     }
     let metadata = metadata_command
+        .other_options(options.cargo_flags.clone())
         .exec()
         .context("reading Cargo project metadata for server build")?;
     // Server package/bin selection is independent from the client target, while
@@ -417,7 +420,8 @@ fn build_server(
         .arg(&host)
         .arg("--bin")
         .arg(&target.name)
-        .arg("--message-format=json-render-diagnostics");
+        .arg("--message-format=json-render-diagnostics")
+        .args(&options.cargo_flags);
     if options.release {
         command.arg("--release");
     }
@@ -644,7 +648,10 @@ pub(crate) fn output_directory(options: &Options) -> Result<PathBuf> {
     if let Some(manifest) = &options.manifest_path {
         command.manifest_path(manifest);
     }
-    let metadata = command.exec().context("reading Cargo project metadata")?;
+    let metadata = command
+        .other_options(options.cargo_flags.clone())
+        .exec()
+        .context("reading Cargo project metadata")?;
     let package = select_package(&metadata, options.package.as_deref())?;
     Ok(package_output_directory(options, package))
 }
@@ -1051,7 +1058,7 @@ name = "library"
             script(
                 &cargo,
                 &format!(
-                    r#"if [ "$1" = metadata ]; then exec {} "$@"; fi
+                    r#"if [ "$1" = metadata ]; then printf '%s\n' "$*" >> {}; exec {} "$@"; fi
 if [ "$1" = -vV ]; then printf 'host: x86_64-unknown-linux-gnu\n'; exit 0; fi
 printf '%s\n' "$*" >> {}
 if echo "$*" | grep -q wasm32-unknown-unknown; then printf wasm > {}; printf '%s\n' {}; else
@@ -1059,6 +1066,7 @@ if echo "$*" | grep -q wasm32-unknown-unknown; then printf wasm > {}; printf '%s
 mkdir -p {}
 printf server > {}
 printf '%s\n' {}; fi"#,
+                    quote(root.join("metadata-args")),
                     quote(real_cargo),
                     quote(root.join("build-args")),
                     quote(&client_wasm),
@@ -1180,6 +1188,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 mode: crate::options::BuildMode::Ssr,
                 features: vec!["frontend".into()],
                 default_features: true,
+                cargo_flags: vec!["--locked".into(), "--offline".into(), "--frozen".into()],
                 server: Some(crate::options::ServerOptions {
                     package: None,
                     bin: None,
@@ -1213,6 +1222,19 @@ printf wasm > "$out/${name}_bg.wasm""#,
             let invocations = fs::read_to_string(root.join("build-args")).unwrap();
             let calls: Vec<_> = invocations.lines().collect();
             assert_eq!(calls.len(), 2);
+            for call in &calls {
+                assert!(call.contains("--locked"));
+                assert!(call.contains("--offline"));
+                assert!(call.contains("--frozen"));
+            }
+            let metadata_calls = fs::read_to_string(root.join("metadata-args")).unwrap();
+            let metadata_calls: Vec<_> = metadata_calls.lines().collect();
+            assert_eq!(metadata_calls.len(), 2);
+            for call in metadata_calls {
+                assert!(call.contains("--locked"));
+                assert!(call.contains("--offline"));
+                assert!(call.contains("--frozen"));
+            }
             assert!(calls[0].contains(&rust_host().unwrap()));
             assert!(calls[0].contains("backend"));
             assert!(calls[0].contains("--no-default-features"));

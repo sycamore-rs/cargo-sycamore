@@ -187,6 +187,7 @@ impl WatchPlan {
             command.manifest_path(manifest);
         }
         let metadata = command
+            .other_options(options.cargo_flags.clone())
             .exec()
             .context("reading Cargo workspace for watching")?;
         let workspace = normalize(metadata.workspace_root.as_std_path());

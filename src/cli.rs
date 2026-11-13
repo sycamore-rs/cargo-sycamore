@@ -159,6 +159,9 @@ mod tests {
                 "--example",
                 "counter",
                 "--release",
+                "--locked",
+                "--offline",
+                "--frozen",
             ])
             .unwrap();
             let args = match cli.command {
@@ -168,6 +171,9 @@ mod tests {
             };
             assert_eq!(args.example.as_deref(), Some("counter"));
             assert!(args.release);
+            assert!(args.locked);
+            assert!(args.offline);
+            assert!(args.frozen);
             assert!(
                 parse(&[
                     "cargo-sycamore",

@@ -33,6 +33,15 @@ pub struct BuildArgs {
     /// Build with Cargo's release profile (CLI only).
     #[arg(long)]
     pub release: bool,
+    /// Require Cargo.lock to remain unchanged (CLI only).
+    #[arg(long)]
+    pub locked: bool,
+    /// Run Cargo without accessing the network (CLI only).
+    #[arg(long)]
+    pub offline: bool,
+    /// Require an unchanged Cargo.lock and no Cargo network access (CLI only).
+    #[arg(long)]
+    pub frozen: bool,
     /// Optimize release WASM (default: true; also [tools.wasm-opt].enable; debug builds skip it).
     #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true, action = clap::ArgAction::Set)]
     pub wasm_opt: Option<bool>,
@@ -42,6 +51,20 @@ pub struct BuildArgs {
     /// Explicit config file; otherwise discover Sycamore.toml or Cargo package metadata.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
+}
+
+impl BuildArgs {
+    fn cargo_flags(&self) -> Vec<String> {
+        [
+            self.locked.then_some("--locked"),
+            self.offline.then_some("--offline"),
+            self.frozen.then_some("--frozen"),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect()
+    }
 }
 
 /// Serve-specific flags, alongside all standard build/watch flags.
@@ -196,6 +219,8 @@ pub struct Options {
     /// Normalized root-relative deployment path, with a trailing slash.
     pub public_url: String,
     pub release: bool,
+    /// CLI-only flags forwarded to every Cargo build and metadata invocation.
+    pub cargo_flags: Vec<String>,
     pub assets: Vec<crate::assets::Asset>,
     pub features: Vec<String>,
     pub default_features: bool,
@@ -224,6 +249,7 @@ impl Default for Options {
             out_dir: None,
             public_url: "/".into(),
             release: false,
+            cargo_flags: Vec::new(),
             assets: Vec::new(),
             features: Vec::new(),
             default_features: true,
@@ -406,6 +432,7 @@ impl Options {
                 .or_else(|| file.out_dir.as_ref().map(|p| absolute(base, p))),
             public_url,
             release: args.release,
+            cargo_flags: args.cargo_flags(),
             assets: file
                 .assets
                 .into_iter()
@@ -542,7 +569,10 @@ fn absolute(base: &Path, path: &Path) -> PathBuf {
 /// yet. In particular, a configured package must not recursively select a file.
 fn package_directory(args: &BuildArgs, cwd: &Path, name: &str) -> Result<PathBuf> {
     let mut command = cargo_metadata::MetadataCommand::new();
-    command.no_deps().current_dir(cwd);
+    command
+        .no_deps()
+        .current_dir(cwd)
+        .other_options(args.cargo_flags());
     if let Some(cargo) = std::env::var_os("CARGO") {
         command.cargo_path(cargo);
     }
@@ -927,6 +957,7 @@ mod tests {
         let options = Options::resolve_in(&BuildArgs::default(), temp.path()).unwrap();
         assert!(options.default_features);
         assert!(options.features.is_empty());
+        assert!(options.cargo_flags.is_empty());
         assert!(!options.release);
         assert!(options.out_dir.is_none());
         assert!(options.manifest_path.is_none());
@@ -958,6 +989,9 @@ mod tests {
             config: Some(PathBuf::from("config/Sycamore.toml")),
             package: Some("cli-package".into()),
             release: true,
+            locked: true,
+            offline: true,
+            frozen: true,
             ..Default::default()
         };
         let options = Options::resolve_in(&args, temp.path()).unwrap();
@@ -979,6 +1013,7 @@ mod tests {
         );
         assert!(!options.default_features);
         assert!(options.release);
+        assert_eq!(options.cargo_flags, ["--locked", "--offline", "--frozen"]);
 
         let args = BuildArgs {
             manifest_path: Some(PathBuf::from("cli/Cargo.toml")),

@@ -33,8 +33,19 @@ Options:
 ```sh
 cargo sycamore build --manifest-path path/to/Cargo.toml
 cargo sycamore build --package my-app --bin client --out-dir dist/site
+cargo sycamore build --locked
+cargo sycamore build --offline
+cargo sycamore build --frozen
 cargo sycamore build --help
 ```
+
+`--locked`, `--offline`, and `--frozen` are CLI-only flags available on `build`,
+`watch`, and `serve`. They are forwarded to every Cargo build and metadata query,
+including client and native server builds and package discovery. Cargo applies
+its usual semantics: `--locked` prevents lockfile changes, `--offline` prevents
+Cargo network access, and `--frozen` combines both restrictions. They do not
+prevent downloads of managed tools such as wasm-bindgen-cli, wasm-opt, or Tailwind;
+those tools must already be cached for a completely offline build.
 
 Settings can also come from `Sycamore.toml` or `[package.metadata.sycamore]` in
 `Cargo.toml`; see [Configuration](#configuration).
