@@ -56,7 +56,7 @@ fn build_application_with(
     cargo: &OsStr,
     mut ensure_tool: impl FnMut(BuiltinTool, &str) -> Result<PathBuf>,
 ) -> Result<BuildOutput> {
-    run_hooks(options, "prebuild", &options.prebuild_hooks)?;
+    run_hooks(options, "prebuild", &options.prebuild_hooks, None)?;
     // Compile the backend first: a failed native build must not publish a new
     // client generation over the currently served output.
     let server = options
@@ -71,11 +71,23 @@ fn build_application_with(
         options.mode == crate::options::BuildMode::Spa,
         server.as_deref(),
     )?;
-    run_hooks(options, "postbuild", &options.postbuild_hooks)?;
+    run_hooks(options, "postbuild", &options.postbuild_hooks, None)?;
     Ok(BuildOutput { directory, server })
 }
 
-fn run_hooks(options: &Options, phase: &str, hooks: &[String]) -> Result<()> {
+fn run_hooks(
+    options: &Options,
+    phase: &str,
+    hooks: &[String],
+    staging: Option<&Path>,
+) -> Result<()> {
+    if hooks.is_empty() {
+        return Ok(());
+    }
+    let staging = staging
+        .map(std::path::absolute)
+        .transpose()
+        .context("resolving staging directory for hooks")?;
     let directory = options
         .config_path
         .as_deref()
@@ -104,6 +116,9 @@ fn run_hooks(options: &Options, phase: &str, hooks: &[String]) -> Result<()> {
             command.arg("-c").arg(hook);
             command
         };
+        if let Some(staging) = &staging {
+            command.env("SYCAMORE_STAGING_DIR", staging);
+        }
         let status = command.current_dir(directory).status().with_context(|| {
             format!(
                 "running {phase} hook {} in {}: {hook}",
@@ -309,6 +324,12 @@ fn build_client_with(
             &options.public_url,
         )?;
     }
+    run_hooks(
+        options,
+        "prepublish",
+        &options.prepublish_hooks,
+        Some(&staging),
+    )?;
     crate::logging::debug(format_args!(
         "Publishing staged build to {}",
         directory.display()
@@ -1260,6 +1281,12 @@ printf wasm > "$out/${name}_bg.wasm""#,
                         quote(root.join("hook-sequence"))
                     ),
                 ],
+                prepublish_hooks: vec![format!(
+                    "test \"$PWD\" = {} && case \"$SYCAMORE_STAGING_DIR\" in /*) ;; *) exit 1 ;; esac && test -f \"$SYCAMORE_STAGING_DIR/sycamore-assets.json\" && test \"$(cat {})\" = 'user-owned index' && mkdir -p \"$SYCAMORE_STAGING_DIR/public\" && printf 'from prepublish' > \"$SYCAMORE_STAGING_DIR/public/hook.txt\" && printf 'prepublish\\n' >> {}",
+                    quote(root.join("config")),
+                    quote(out.join("public/index.html")),
+                    quote(root.join("hook-sequence"))
+                )],
                 postbuild_hooks: vec![
                     format!(
                         "test -f {} && printf 'post-one\\n' >> {}",
@@ -1298,6 +1325,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
                     "pre-two",
                     "native-build",
                     "client-build",
+                    "prepublish",
                     "post-one",
                     "post-two"
                 ]
@@ -1309,10 +1337,51 @@ printf wasm > "$out/${name}_bg.wasm""#,
             assert_eq!(manifest["bootstrap"], "/test_app.bootstrap.js");
             assert_eq!(manifest["js"], "/test_app.js");
             assert_eq!(manifest["wasm"], "/test_app_bg.wasm");
+            assert_eq!(
+                fs::read_to_string(output.directory.join("public/hook.txt")).unwrap(),
+                "from prepublish"
+            );
+
+            // A failed prepublish hook leaves the current generation intact and
+            // retains both generated and hook-created staging artifacts for inspection.
+            fs::write(out.join("public/index.html"), "user-owned stale index").unwrap();
+            fs::write(out.join("public/previous.txt"), "previous published bytes").unwrap();
+            options.prepublish_hooks = vec![
+                "printf partial > \"$SYCAMORE_STAGING_DIR/public/partial.txt\" && false".into(),
+                format!(
+                    "printf skipped > {}",
+                    quote(root.join("later-prepublish-ran"))
+                ),
+            ];
+            options.postbuild_hooks = vec![format!(
+                "printf skipped > {}",
+                quote(root.join("postbuild-ran"))
+            )];
+            let error =
+                build_application_with(&options, cargo.as_os_str(), |_, _| Ok(bindgen.clone()))
+                    .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("prepublish hook 1"), "{message}");
+            assert!(message.contains("exit status: 1"), "{message}");
+            assert_eq!(
+                fs::read_to_string(out.join("public/index.html")).unwrap(),
+                "user-owned stale index"
+            );
+            assert_eq!(
+                fs::read_to_string(out.join("public/previous.txt")).unwrap(),
+                "previous published bytes"
+            );
+            assert!(!root.join("later-prepublish-ran").exists());
+            assert!(!root.join("postbuild-ran").exists());
+            assert_eq!(
+                fs::read_to_string(out.join(".staging/public/partial.txt")).unwrap(),
+                "partial"
+            );
+            assert!(out.join(".staging/sycamore-assets.json").is_file());
 
             let invocations = fs::read_to_string(root.join("build-args")).unwrap();
             let calls: Vec<_> = invocations.lines().collect();
-            assert_eq!(calls.len(), 2);
+            assert_eq!(calls.len(), 4);
             for call in &calls {
                 assert!(call.contains("--locked"));
                 assert!(call.contains("--offline"));
@@ -1320,7 +1389,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
             }
             let metadata_calls = fs::read_to_string(root.join("metadata-args")).unwrap();
             let metadata_calls: Vec<_> = metadata_calls.lines().collect();
-            assert_eq!(metadata_calls.len(), 2);
+            assert_eq!(metadata_calls.len(), 4);
             for call in metadata_calls {
                 assert!(call.contains("--locked"));
                 assert!(call.contains("--offline"));
@@ -1336,6 +1405,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
             assert!(!calls[1].contains("--no-default-features"));
 
             options.prebuild_hooks.clear();
+            options.prepublish_hooks.clear();
             options.postbuild_hooks = vec![
                 format!(
                     "test -f {} && false",
@@ -1378,6 +1448,10 @@ printf wasm > "$out/${name}_bg.wasm""#,
                     "printf 'pre\\n' >> {}",
                     quote(root.join("hook-sequence"))
                 )],
+                prepublish_hooks: vec![format!(
+                    "printf unexpected > {}",
+                    quote(root.join("prepublish-ran"))
+                )],
                 postbuild_hooks: vec![format!(
                     "printf 'post\\n' >> {}",
                     quote(root.join("hook-sequence"))
@@ -1398,6 +1472,7 @@ printf wasm > "$out/${name}_bg.wasm""#,
                 "previous asset"
             );
             assert_eq!(fs::read_dir(out.join("public")).unwrap().count(), 2);
+            assert!(!root.join("prepublish-ran").exists());
             assert_eq!(
                 fs::read_to_string(root.join("hook-sequence"))
                     .unwrap()

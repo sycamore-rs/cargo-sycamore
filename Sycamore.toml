@@ -84,6 +84,9 @@ use-gitignore = true
 # Ordered shell commands, run once per build/watch/serve rebuild from this directory.
 # A failed command fails the build and skips later hooks.
 # prebuild-hooks = ["echo Preparing build"]
+# Prepublish hooks run after generation, before publication. SYCAMORE_STAGING_DIR
+# is an absolute staging-root path; browser-facing files belong under public/.
+# prepublish-hooks = ['echo Artifact > "$SYCAMORE_STAGING_DIR/public/artifact.txt"'] # Unix shell.
 # Postbuild hooks run after publication; their side effects are not rolled back.
 # postbuild-hooks = ["echo Build complete"]
 

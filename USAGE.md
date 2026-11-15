@@ -127,16 +127,26 @@ Configure shell commands to run around each application build:
 ```toml
 [tools]
 prebuild-hooks = ["echo Preparing build"]
+prepublish-hooks = ['echo Generated artifact > "$SYCAMORE_STAGING_DIR/public/artifact.txt"']
 postbuild-hooks = ["echo Build complete"]
 ```
 
-In Cargo metadata, use `[package.metadata.sycamore.tools]` instead. Both arrays
-are optional and default to `[]`; there are no corresponding CLI flags.
+In Cargo metadata, use `[package.metadata.sycamore.tools]` instead. All three arrays
+are optional and default to `[]`; there are no corresponding CLI flags. The example
+prepublish command uses Unix shell syntax; Windows commands can reference
+`%SYCAMORE_STAGING_DIR%` instead.
 
 - Prebuild hooks run before compiling either the native server or browser client.
-  Postbuild hooks run only after both builds and output publication succeed. Hooks
-  run once per application build, including each `watch` and `serve` rebuild, not
-  separately for the server and client.
+  Prepublish hooks run after staged assets, bindings, CSS, bootstrap, manifest, and
+  SPA HTML have been generated, but before old published output is removed.
+  Postbuild hooks run only after output publication succeeds. Hooks run once per
+  application build, including each `watch` and `serve` rebuild, not separately for
+  the server and client.
+- Prepublish commands receive `SYCAMORE_STAGING_DIR`, an absolute path to the
+  staging root. Write browser-facing artifacts under its `public/` directory;
+  successful publication includes these files automatically. Staging is excluded
+  from watch triggers. Prepublish hooks should not change generated JS/WASM/CSS
+  without also updating the asset manifest, whose hashes were already generated.
 - Commands run sequentially, in array order, using `sh -c` on Unix or `cmd.exe /D /S /C`
   on Windows. Shell syntax, quoting, and executable availability follow that platform.
   Each entry uses a fresh shell, so directory or environment changes do not carry
@@ -147,7 +157,9 @@ are optional and default to `[]`; there are no corresponding CLI flags.
   the environment and stdin/stdout/stderr. Cargo flags are not automatically added
   to commands inside hooks.
 - A command that cannot start or exits unsuccessfully fails the build and skips
-  remaining hooks. Prebuild or compilation failures skip postbuild hooks. Watch/serve
+  remaining hooks. Prebuild, compilation, or prepublish failures skip postbuild hooks.
+  A failed prepublish hook prevents publication and preserves the previous published
+  output; partial staged files remain until the next build resets staging. Watch/serve
   reports the error and waits for changes; it does not activate the new generation
   until all postbuild hooks succeed.
 - Hook side effects are not rolled back. In particular, postbuild hooks run against
