@@ -874,6 +874,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backend_only_injects_reload_inside_the_opaque_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let (port, task) = start_backend(Router::new().fallback(|| async {
+            let chunks = [
+                "<!doctype html><html><head><title>SSR</title><!--opaque-range--><meta name=\"cargo-",
+                "sycamore-bootstrap\"><!--/opaque-range--></head><body>SSR</body></html>",
+            ];
+            let stream = futures_util::stream::iter(chunks.map(Ok::<_, std::io::Error>));
+            ([(header::CONTENT_TYPE, "text/html")], Body::from_stream(stream))
+        }))
+        .await;
+        let state = Arc::new(proxy_state(temp.path(), port, false, true));
+        let version = state.version(0);
+        let app = router(state);
+        let response = request(&app, Method::GET, "/posts/1").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = text(response).await;
+        assert_eq!(
+            html,
+            format!(
+                r#"<!doctype html><html><head><title>SSR</title><!--opaque-range--><script type="module" src="/__sycamore/reload.js" data-cargo-sycamore-reload data-version="{version}"></script><!--/opaque-range--></head><body>SSR</body></html>"#
+            )
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn forwards_application_websockets_with_subprotocol() {
         use futures_util::SinkExt;
         let (backend_port, backend_task) = start_backend(Router::new().route(

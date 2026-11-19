@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use futures_util::{SinkExt, StreamExt, stream};
+use futures_util::{SinkExt, Stream, StreamExt, stream};
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 
 /// Prefixes match whole path segments, never `/apiary` for `/api`.
@@ -166,12 +166,7 @@ async fn forward_http(
             let script = Bytes::from(format!(
                 r#"<script type="module" src="/__sycamore/reload.js" data-cargo-sycamore-reload data-version="{version}"></script>"#
             ));
-            // Do not buffer SSR streams or parse/rewrite the application's HTML.
-            Body::from_stream(
-                response
-                    .bytes_stream()
-                    .chain(stream::once(async move { Ok::<_, reqwest::Error>(script) })),
-            )
+            Body::from_stream(inject_reload(response.bytes_stream(), script))
         }
     } else if head {
         Body::empty()
@@ -182,6 +177,77 @@ async fn forward_http(
     *result.status_mut() = status;
     *result.headers_mut() = headers;
     Ok(result)
+}
+
+const OPAQUE_START: &[u8] = b"<!--opaque-range-->";
+const OPAQUE_END: &[u8] = b"<!--/opaque-range-->";
+const BOOTSTRAP_SLOT: &[u8] =
+    br#"<!--opaque-range--><meta name="cargo-sycamore-bootstrap"><!--/opaque-range-->"#;
+
+fn inject_reload<E>(
+    upstream: impl Stream<Item = Result<Bytes, E>>,
+    script: Bytes,
+) -> impl Stream<Item = Result<Bytes, E>> {
+    stream::unfold(
+        (Box::pin(upstream.fuse()), Bytes::new(), Some(script)),
+        |(mut upstream, mut pending, script)| async move {
+            loop {
+                let chunk = match upstream.next().await {
+                    Some(Ok(chunk)) => chunk,
+                    Some(Err(error)) => return Some((Err(error), (upstream, Bytes::new(), None))),
+                    None => {
+                        // No slot was found: preserve any partial match and append
+                        // the script at EOF, as before.
+                        let script = script?;
+                        let chunk = if pending.is_empty() {
+                            script
+                        } else {
+                            [pending.as_ref(), script.as_ref()].concat().into()
+                        };
+                        return Some((Ok(chunk), (upstream, Bytes::new(), None)));
+                    }
+                };
+                let Some(reload) = &script else {
+                    return Some((Ok(chunk), (upstream, pending, script)));
+                };
+                let chunk = if pending.is_empty() {
+                    chunk
+                } else {
+                    [pending.as_ref(), chunk.as_ref()].concat().into()
+                };
+                if let Some(start) = chunk
+                    .windows(BOOTSTRAP_SLOT.len())
+                    .position(|w| w == BOOTSTRAP_SLOT)
+                {
+                    let replaced = [
+                        &chunk[..start + OPAQUE_START.len()],
+                        reload.as_ref(),
+                        &chunk[start + BOOTSTRAP_SLOT.len() - OPAQUE_END.len()..],
+                    ]
+                    .concat()
+                    .into();
+                    return Some((Ok(replaced), (upstream, Bytes::new(), None)));
+                }
+
+                // Hold back only a possible prefix of the exact Sycamore slot,
+                // so a slot can straddle chunks without buffering the page.
+                let limit = chunk.len().min(BOOTSTRAP_SLOT.len() - 1);
+                let carry = (1..=limit)
+                    .rev()
+                    .find(|&len| chunk.ends_with(&BOOTSTRAP_SLOT[..len]))
+                    .unwrap_or(0);
+                let end = chunk.len() - carry;
+                pending = if carry == 0 {
+                    Bytes::new()
+                } else {
+                    Bytes::copy_from_slice(&chunk[end..])
+                };
+                if end != 0 {
+                    return Some((Ok(chunk.slice(..end)), (upstream, pending, script)));
+                }
+            }
+        },
+    )
 }
 
 async fn forward_websocket(request: Request, port: u16) -> Response {
@@ -357,6 +423,40 @@ async fn relay_websocket(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn replaces_the_slot_across_any_chunk_boundary() {
+        let input = [
+            b"<head>".as_slice(),
+            BOOTSTRAP_SLOT,
+            b"</head><body>App</body>",
+        ]
+        .concat();
+        let replacement = Bytes::from_static(b"<script>reload()</script>");
+        let expected = b"<head><!--opaque-range--><script>reload()</script><!--/opaque-range--></head><body>App</body>";
+        for split in 0..=input.len() {
+            let chunks = input.split_at(split);
+            let upstream = stream::iter(
+                [chunks.0, chunks.1]
+                    .map(|chunk| Ok::<_, std::io::Error>(Bytes::copy_from_slice(chunk))),
+            );
+            let body = Body::from_stream(inject_reload(upstream, replacement.clone()));
+            assert_eq!(
+                axum::body::to_bytes(body, 1024).await.unwrap(),
+                &expected[..]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_a_partial_slot_at_eof_before_appending_reload() {
+        let input = b"<head><!--opaque-range--><meta name=\"cargo-sycamore-boot";
+        let upstream = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(input))]);
+        let script = Bytes::from_static(b"<script>reload()</script>");
+        let expected = [input.as_slice(), script.as_ref()].concat();
+        let body = Body::from_stream(inject_reload(upstream, script));
+        assert_eq!(axum::body::to_bytes(body, 1024).await.unwrap(), expected);
+    }
 
     #[test]
     fn routes_match_segment_boundaries() {

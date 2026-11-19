@@ -614,10 +614,14 @@ snapshots. Compilation/configuration failures preserve the last good served outp
 The dev proxy supports streaming HTTP and application WebSockets. Application
 response statuses and headers are preserved, except hop-by-hop headers; with
 autoreload, eligible HTML responses have reload metadata adjusted as described
-below. It requests identity encoding for reload injection. Only an identity,
-`text/html`, status-200 response gets the reload module appended at the end of the
-stream; content length and validators are removed. Compressed HTML is passed through
-untouched. A Content Security Policy may block the injected development script.
+below. It requests identity encoding for reload injection. In an identity,
+`text/html`, status-200 response, the proxy replaces the `CargoSycamoreMeta`
+placeholder with the reload module when it sees the exact opaque-range markup
+shown above. The comments are preserved, and the response is still streamed.
+Without that markup, the proxy appends the reload module at the end of the stream
+as before. Content length and validators are removed. Compressed HTML is passed
+through untouched. A Content Security Policy may block the injected development
+script.
 
 The Axum frontend supports GET/HEAD, directory `index.html`, byte ranges for static
 assets, and MIME types including `application/wasm`. Traversal and symlinks outside
