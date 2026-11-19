@@ -158,20 +158,46 @@ fn process(
     stylesheet: Option<&str>,
     public_url: &str,
 ) -> Result<String> {
+    let js = format!("{public_url}{}", file_url(&format!("{output_name}.js")));
+    let wasm = format!(
+        "{public_url}{}",
+        file_url(&format!("{output_name}_bg.wasm"))
+    );
+    let js_preload =
+        format!(r#"<link rel="modulepreload" href="{js}" data-cargo-sycamore-preload="js">"#);
+    // Match wasm-bindgen's fetch request so the browser can reuse the preload.
+    let wasm_preload = format!(
+        r#"<link rel="preload" as="fetch" type="application/wasm" crossorigin="anonymous" href="{wasm}" data-cargo-sycamore-preload="wasm">"#
+    );
+    let css_preload = stylesheet.map(|href| {
+        format!(
+            r#"<link rel="preload" as="style" href="{href}" data-cargo-sycamore-preload="css">"#
+        )
+    });
     let link = stylesheet.map(|href| {
         format!(r#"<link rel="stylesheet" href="{href}" data-cargo-sycamore-tailwind>"#)
     });
-    let filename = format!("{output_name}.js");
-    let filename = utf8_percent_encode(&filename, ASSET_PATH);
     let script = format!(
         r#"<script type="module" data-cargo-sycamore>
-import init from "{public_url}{filename}";
+import init from "{js}";
 init().catch(error => console.error("Failed to initialize WASM:", error));
 </script>"#
     );
     inject_head(
         template,
         &[
+            (
+                r#"link[data-cargo-sycamore-preload="js"]"#,
+                Some(&js_preload),
+            ),
+            (
+                r#"link[data-cargo-sycamore-preload="wasm"]"#,
+                Some(&wasm_preload),
+            ),
+            (
+                r#"link[data-cargo-sycamore-preload="css"]"#,
+                css_preload.as_deref(),
+            ),
             (BOOTSTRAP_SCRIPT, Some(&script)),
             ("link[data-cargo-sycamore-tailwind]", link.as_deref()),
         ],
@@ -316,7 +342,7 @@ mod tests {
         fs::create_dir_all(out.join("assets")).unwrap();
         let css = out.join("assets/my styles #%.css");
         fs::write(&css, "body{}").unwrap();
-        let template = "<head><link rel=stylesheet href='user.css'><link rel=stylesheet href='old.css' data-cargo-sycamore-tailwind></head><body>App</body>";
+        let template = "<head><link rel=stylesheet href='user.css'><link rel=stylesheet href='old.css' data-cargo-sycamore-tailwind><link rel=preload as=image href='user.png'></head><body>App</body>";
         fs::write(root.join("index.html"), template).unwrap();
         generate_with_stylesheet(root, &out, "app", Some(&css), "/my-app/").unwrap();
         let generated = fs::read_to_string(out.join("index.html")).unwrap();
@@ -349,14 +375,24 @@ mod tests {
             fs::read_to_string(root.join("index.html")).unwrap(),
             template
         );
-        let replaced = process(&generated, "app", Some("./other.css"), "/my-app/").unwrap();
         assert_eq!(
             count(
-                &Html::parse_document(&replaced),
-                "link[data-cargo-sycamore-tailwind]"
+                &document,
+                "head link[rel=preload][as=style][href='/my-app/assets/my%20styles%20%23%25.css']"
             ),
             1
         );
+        let replaced = process(&generated, "new app", Some("./other.css"), "/my-app/").unwrap();
+        let replaced = Html::parse_document(&replaced);
+        assert_eq!(count(&replaced, "link[data-cargo-sycamore-tailwind]"), 1);
+        assert_eq!(count(&replaced, "link[data-cargo-sycamore-preload]"), 3);
+        assert_eq!(count(&replaced, "link[href='/my-app/app.js']"), 0);
+        assert_eq!(count(&replaced, "link[href='/my-app/app_bg.wasm']"), 0);
+        assert_eq!(count(&replaced, "link[rel=preload][href='./other.css']"), 1);
+        let disabled = process(&generated, "app", None, "/my-app/").unwrap();
+        let disabled = Html::parse_document(&disabled);
+        assert_eq!(count(&disabled, "link[rel=preload][as=style]"), 0);
+        assert_eq!(count(&disabled, "link[rel=preload][href='user.png']"), 1);
         generate(root, &out, "app", "/").unwrap();
         let disabled = Html::parse_document(&fs::read_to_string(out.join("index.html")).unwrap());
         assert_eq!(count(&disabled, "link[data-cargo-sycamore-tailwind]"), 0);
@@ -393,6 +429,7 @@ mod tests {
             let (range, after_end) = after_start.split_once("<!--/opaque-range-->").unwrap();
             assert!(after_end.starts_with("<title>SSR</title>"));
             assert!(range.starts_with(r#"<base href="/site/">"#));
+            assert_eq!(range.matches("data-cargo-sycamore-preload=").count(), 3);
             assert!(range.contains(r#"import init from "/site/app.js""#));
             assert!(range.contains(r#"href="/app.css""#));
             assert_eq!(range.contains(r#"data-version="session-2""#), expect_reload);
@@ -413,7 +450,12 @@ mod tests {
             .child_elements()
             .map(|el| el.value().name())
             .collect();
-        assert_eq!(tags, ["base", "title", "script", "link", "script"]);
+        assert_eq!(
+            tags,
+            [
+                "base", "title", "link", "link", "link", "script", "link", "script"
+            ]
+        );
         assert_eq!(
             count(&document, "body meta[name='cargo-sycamore-bootstrap']"),
             1
@@ -547,13 +589,35 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
     }
 
     #[test]
-    fn default_template_has_a_module_in_head() {
-        let html = process(DEFAULT_HTML, "my_app", None, "/").unwrap();
+    fn default_template_preloads_bindings_and_wasm_before_startup() {
+        let html = process(DEFAULT_HTML, "my app", None, "/preview/").unwrap();
         let document = Html::parse_document(&html);
         let script = first(&document, "head script[type=module][data-cargo-sycamore]");
-        assert!(text(script).contains("import init from \"/my_app.js\""));
+        assert!(text(script).contains("import init from \"/preview/my%20app.js\""));
         assert!(text(script).contains("init().catch("));
         assert_eq!(count(&document, "meta[charset]"), 1);
+        assert_eq!(
+            count(&document, "head link[data-cargo-sycamore-preload]"),
+            2
+        );
+        assert_eq!(
+            count(
+                &document,
+                "head link[rel=modulepreload][href='/preview/my%20app.js']"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &document,
+                "head link[rel=preload][as=fetch][type='application/wasm'][crossorigin=anonymous][href='/preview/my%20app_bg.wasm']"
+            ),
+            1
+        );
+        assert!(
+            html.find("data-cargo-sycamore-preload=\"wasm\"").unwrap()
+                < html.find("<script").unwrap()
+        );
     }
 
     #[test]

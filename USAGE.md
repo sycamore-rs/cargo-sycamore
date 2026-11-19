@@ -298,6 +298,13 @@ are supplied by the parser, and user content/scripts are preserved (formatting
 may be normalized). A previous `script[data-cargo-sycamore]` is replaced rather
 than duplicated; that marker is reserved for generated startup scripts.
 
+The generated `<head>` preloads the bindings with `rel="modulepreload"`, the WASM
+with `rel="preload" as="fetch" type="application/wasm" crossorigin="anonymous"`,
+and the compiled Tailwind stylesheet (when enabled) with `rel="preload" as="style"`.
+The regular stylesheet link still applies the CSS. Cargo Sycamore replaces its
+own preload links (`data-cargo-sycamore-preload`) on regeneration and leaves
+user-authored links and copied assets alone.
+
 If Sycamore renders the entire SPA template, including `<head>`, use its
 `CargoSycamoreMeta` component to reserve a spot for generated tags:
 
@@ -305,12 +312,12 @@ If Sycamore renders the entire SPA template, including `<head>`, use its
 <!--opaque-range--><meta name="cargo-sycamore-bootstrap"><!--/opaque-range-->
 ```
 
-Cargo Sycamore replaces the `<meta>` in place with the startup script, the
-Tailwind stylesheet link when enabled, and a base URL if the template does not
-already provide one. The opaque-range comments stay intact so hydration can
-skip those tags. When `cargo sycamore serve` serves the generated page with
-autoreload enabled, it inserts the reload script there too. Without the
-placeholder, scripts and stylesheets are appended to `<head>` as usual, and a
+Cargo Sycamore replaces the `<meta>` in place with the preload links, the
+startup script, the Tailwind stylesheet link when enabled, and a base URL if
+the template does not already provide one. The opaque-range comments stay
+intact so hydration can skip those tags. When `cargo sycamore serve` serves the
+generated page with autoreload enabled, it inserts the reload script there too.
+Without the placeholder, scripts and links are appended to `<head>`, and a
 missing base element is prepended.
 
 Every build mode also publishes `<output_name>.bootstrap.js` under
@@ -323,8 +330,11 @@ Values are root-relative public URLs (for example, `/my_app.bootstrap.js`,
 paths. `public_url` records the normalized deployment prefix (default `/`), and
 all asset URLs include it. The `bootstrap` value points to the generated bootstrap filename, which is
 derived from the client artifact name to avoid colliding with wasm-bindgen output.
-The bootstrap imports the client JS and initializes WASM. SSR applications can
-read this manifest to emit their own HTML and asset links.
+The bootstrap imports the client JS and initializes WASM. The generated SPA
+shell starts the client inline, so it does not fetch or preload the separate
+bootstrap file. SSR applications using the external bootstrap can emit
+`rel="modulepreload"` links for both `bootstrap` and `js` from the manifest and
+use the same WASM and optional stylesheet preload attributes as the SPA shell.
 
 The SPA source template is never overwritten. Choosing an output path that would
 overwrite it produces an error. Changes to the client package's `index.html`,
@@ -349,8 +359,8 @@ cargo sycamore serve --public-url /preview
 
 The CLI flag takes precedence over config; `--public-url /` resets the prefix to
 the site root. The default is `/`; a missing trailing slash is added automatically.
-Generated HTML imports, stylesheet links, and asset-manifest URLs use this prefix,
-for example `/my-app/my_app.js`. Generated SPA HTML also gets a
+Generated HTML imports, preload and stylesheet links, and asset-manifest URLs
+use this prefix, for example `/my-app/my_app.js`. Generated SPA HTML also gets a
 `<base href="/my-app/">` unless the template already supplies a base element.
 The bootstrap's own imports remain module-relative, so wasm-bindgen can resolve
 its JS, WASM, and auxiliary files under the same prefix.
