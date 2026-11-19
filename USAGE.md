@@ -298,6 +298,21 @@ are supplied by the parser, and user content/scripts are preserved (formatting
 may be normalized). A previous `script[data-cargo-sycamore]` is replaced rather
 than duplicated; that marker is reserved for generated startup scripts.
 
+If Sycamore renders the entire SPA template, including `<head>`, use its
+`CargoSycamoreMeta` component to reserve a spot for generated tags:
+
+```html
+<!--opaque-range--><meta name="cargo-sycamore-bootstrap"><!--/opaque-range-->
+```
+
+Cargo Sycamore replaces the `<meta>` in place with the startup script, the
+Tailwind stylesheet link when enabled, and a base URL if the template does not
+already provide one. The opaque-range comments stay intact so hydration can
+skip those tags. When `cargo sycamore serve` serves the generated page with
+autoreload enabled, it inserts the reload script there too. Without the
+placeholder, scripts and stylesheets are appended to `<head>` as usual, and a
+missing base element is prepended.
+
 Every build mode also publishes `<output_name>.bootstrap.js` under
 `<build-root>/public/` and `sycamore-assets.json` at the build root (for example,
 `dist/sycamore-assets.json`); the manifest is staged at

@@ -50,12 +50,10 @@ pub(crate) fn generate_with_stylesheet(
                 .with_context(|| format!("reading HTML template {}", source.display()));
         }
     };
-    let html = process(&template, output_name, public_url)?;
     let href = stylesheet
         .map(|path| stylesheet_href(out_dir, path, public_url))
         .transpose()?;
-    let html = with_stylesheet(&html, href.as_deref())?;
-    let html = with_spa_base(&html, public_url)?;
+    let html = process(&template, output_name, href.as_deref(), public_url)?;
     let mut output = tempfile::NamedTempFile::new_in(out_dir)?;
     output.write_all(html.as_bytes())?;
     #[cfg(unix)]
@@ -152,18 +150,17 @@ fn atomic_write(destination: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn with_stylesheet(template: &str, href: Option<&str>) -> Result<String> {
-    let link = href.map(|href| {
+const BOOTSTRAP_SCRIPT: &str = "script[data-cargo-sycamore]";
+
+fn process(
+    template: &str,
+    output_name: &str,
+    stylesheet: Option<&str>,
+    public_url: &str,
+) -> Result<String> {
+    let link = stylesheet.map(|href| {
         format!(r#"<link rel="stylesheet" href="{href}" data-cargo-sycamore-tailwind>"#)
     });
-    replace_generated_element(
-        template,
-        link.as_deref(),
-        "link[data-cargo-sycamore-tailwind]",
-    )
-}
-
-fn process(template: &str, output_name: &str, public_url: &str) -> Result<String> {
     let filename = format!("{output_name}.js");
     let filename = utf8_percent_encode(&filename, ASSET_PATH);
     let script = format!(
@@ -172,7 +169,14 @@ import init from "{public_url}{filename}";
 init().catch(error => console.error("Failed to initialize WASM:", error));
 </script>"#
     );
-    append_script(template, &script, "script[data-cargo-sycamore]")
+    inject_head(
+        template,
+        &[
+            (BOOTSTRAP_SCRIPT, Some(&script)),
+            ("link[data-cargo-sycamore-tailwind]", link.as_deref()),
+        ],
+        Some(public_url),
+    )
 }
 
 /// Inject only into HTTP responses; never add development code to build output.
@@ -185,83 +189,101 @@ pub(crate) fn with_reload_client(template: &str, version: &str) -> Result<String
     let script = format!(
         r#"<script type="module" src="/__sycamore/reload.js" data-cargo-sycamore-reload data-version="{version}"></script>"#
     );
-    append_script(template, &script, "script[data-cargo-sycamore-reload]")
+    inject_head(
+        template,
+        &[("script[data-cargo-sycamore-reload]", Some(&script))],
+        None,
+    )
 }
 
 /// SPA fallbacks keep root-relative asset resolution on nested browser routes.
 /// Honor an explicit user base URL; never write this change to disk.
 pub(crate) fn with_spa_base(template: &str, public_url: &str) -> Result<String> {
-    let mut document = Html::parse_document(template);
-    let base_selector = Selector::parse("head base[href]").expect("valid base selector");
-    if document.select(&base_selector).next().is_none() {
-        let head_selector = Selector::parse("head").expect("valid head selector");
-        let head = document
-            .select(&head_selector)
-            .next()
-            .context("HTML document has no head")?
-            .id();
-        let fragment = Html::parse_fragment(&format!(r#"<base href="{public_url}">"#));
-        let fragment_selector = Selector::parse("base[href]").expect("valid base selector");
-        let base = fragment
-            .select(&fragment_selector)
-            .next()
-            .context("could not create SPA base element")?;
-        document
-            .tree
-            .get_mut(head)
-            .context("head missing from tree")?
-            .prepend(Node::Element(base.value().clone()));
-    }
-    Ok(document.html())
+    inject_head(template, &[], Some(public_url))
 }
 
-fn append_script(template: &str, script: &str, selector: &str) -> Result<String> {
-    replace_generated_element(template, Some(script), selector)
-}
-
-fn replace_generated_element(
+fn inject_head(
     template: &str,
-    element: Option<&str>,
-    selector: &str,
+    elements: &[(&str, Option<&str>)],
+    base_url: Option<&str>,
 ) -> Result<String> {
-    // html5ever supplies implicit head/body elements and handles casing,
-    // comments, and omitted closing tags without string replacement.
+    // html5ever supplies implicit head/body elements and distinguishes actual
+    // elements from tag-like text in comments, scripts, and templates.
     let mut document = Html::parse_document(template);
     let head_selector = Selector::parse("head").expect("valid head selector");
     let head = document
         .select(&head_selector)
         .next()
-        .context("HTML document has no head")?
-        .id();
-    let generated_selector = Selector::parse(selector)
-        .map_err(|_| anyhow::anyhow!("invalid generated-element selector"))?;
-    let previous: Vec<_> = document
-        .select(&generated_selector)
-        .map(|script| script.id())
-        .collect();
+        .context("HTML document has no head")?;
+    let slot_selector =
+        Selector::parse(r#"meta[name="cargo-sycamore-bootstrap"]"#).expect("valid slot selector");
+    let rendered_slot_selector = Selector::parse(r#"script[data-cargo-sycamore="slot"]"#)
+        .expect("valid rendered slot selector");
+    let placeholder = head
+        .child_elements()
+        .find(|el| slot_selector.matches(el))
+        .map(|el| el.id());
+    // The served reload client must go into the same range even after the
+    // build has consumed the placeholder.
+    let slot = placeholder.or_else(|| {
+        head.child_elements()
+            .find(|el| rendered_slot_selector.matches(el))
+            .map(|el| el.id())
+    });
+    let head = head.id();
+    let base_selector = Selector::parse("head base[href]").expect("valid base selector");
+    let base = base_url
+        .filter(|_| document.select(&base_selector).next().is_none())
+        .map(|url| format!(r#"<base href="{url}">"#));
+    let mut previous = Vec::new();
+    for (selector, element) in
+        std::iter::once(("base[href]", base.as_deref())).chain(elements.iter().copied())
+    {
+        let generated_selector =
+            Selector::parse(selector).expect("valid generated-element selector");
+        let is_base = selector == "base[href]";
+        if !is_base {
+            previous.extend(document.select(&generated_selector).map(|el| el.id()));
+        }
+        let Some(element) = element else { continue };
+        let fragment = Html::parse_fragment(element);
+        let element = fragment
+            .select(&generated_selector)
+            .next()
+            .context("could not create generated element")?;
+        let mut value = element.value().clone();
+        if selector == BOOTSTRAP_SCRIPT && slot.is_some() {
+            let (_, marker) = value
+                .attrs
+                .iter_mut()
+                .find(|(name, _)| &*name.local == "data-cargo-sycamore")
+                .expect("bootstrap attribute");
+            *marker = "slot".into();
+        }
+        let mut target = document
+            .tree
+            .get_mut(slot.unwrap_or(head))
+            .context("head insertion point missing from tree")?;
+        let mut inserted = if slot.is_some() {
+            target.insert_before(Node::Element(value))
+        } else if is_base {
+            target.prepend(Node::Element(value))
+        } else {
+            target.append(Node::Element(value))
+        };
+        for child in element.children() {
+            inserted.append(child.value().clone());
+        }
+    }
+    if !elements.is_empty() {
+        previous.extend(placeholder);
+    }
     for id in previous {
         document
             .tree
             .get_mut(id)
             .context("generated element missing from tree")?
             .detach();
-    }
-    let Some(element) = element else {
-        return Ok(document.html());
-    };
-    let fragment = Html::parse_fragment(element);
-    let script = fragment
-        .select(&generated_selector)
-        .next()
-        .context("could not create generated element")?;
-    let mut head = document
-        .tree
-        .get_mut(head)
-        .context("head missing from tree")?;
-    let mut inserted = head.append(Node::Element(script.value().clone()));
-    // Script contents are parsed as raw text, not nested HTML elements.
-    for child in script.children() {
-        inserted.append(child.value().clone());
     }
     Ok(document.html())
 }
@@ -327,7 +349,7 @@ mod tests {
             fs::read_to_string(root.join("index.html")).unwrap(),
             template
         );
-        let replaced = with_stylesheet(&generated, Some("./other.css")).unwrap();
+        let replaced = process(&generated, "app", Some("./other.css"), "/my-app/").unwrap();
         assert_eq!(
             count(
                 &Html::parse_document(&replaced),
@@ -346,6 +368,54 @@ mod tests {
                 &Html::parse_document(&fs::read_to_string(out.join("index.html")).unwrap()),
                 "head link[data-cargo-sycamore-tailwind]"
             ),
+            1
+        );
+    }
+
+    #[test]
+    fn replaces_bootstrap_placeholder_inside_opaque_range() {
+        let template = r#"<head><meta charset="utf-8"><!--opaque-range--><META NAME='cargo-sycamore-bootstrap'><!--/opaque-range--><title>SSR</title></head><body><meta name="cargo-sycamore-bootstrap"><main>App</main></body>"#;
+        let built = process(template, "app", Some("/app.css"), "/site/").unwrap();
+        let served = with_reload_client(&built, "session-1").unwrap();
+        let served = with_reload_client(&served, "session-2").unwrap();
+
+        for (html, expect_reload) in [(&built, false), (&served, true)] {
+            let document = Html::parse_document(html);
+            assert_eq!(
+                count(&document, "head meta[name='cargo-sycamore-bootstrap']"),
+                0
+            );
+            assert_eq!(
+                count(&document, "body meta[name='cargo-sycamore-bootstrap']"),
+                1
+            );
+            let (_, after_start) = html.split_once("<!--opaque-range-->").unwrap();
+            let (range, after_end) = after_start.split_once("<!--/opaque-range-->").unwrap();
+            assert!(after_end.starts_with("<title>SSR</title>"));
+            assert!(range.starts_with(r#"<base href="/site/">"#));
+            assert!(range.contains(r#"import init from "/site/app.js""#));
+            assert!(range.contains(r#"href="/app.css""#));
+            assert_eq!(range.contains(r#"data-version="session-2""#), expect_reload);
+            assert_eq!(
+                count(&document, "script[data-cargo-sycamore-reload]"),
+                usize::from(expect_reload)
+            );
+        }
+    }
+
+    #[test]
+    fn no_head_placeholder_keeps_legacy_placement() {
+        let template = r#"<head><!-- <meta name="cargo-sycamore-bootstrap"> --><title>App</title></head><body><meta name="cargo-sycamore-bootstrap"></body>"#;
+        let built = process(template, "app", Some("/app.css"), "/").unwrap();
+        let served = with_reload_client(&built, "version").unwrap();
+        let document = Html::parse_document(&served);
+        let tags: Vec<_> = first(&document, "head")
+            .child_elements()
+            .map(|el| el.value().name())
+            .collect();
+        assert_eq!(tags, ["base", "title", "script", "link", "script"]);
+        assert_eq!(
+            count(&document, "body meta[name='cargo-sycamore-bootstrap']"),
             1
         );
     }
@@ -420,7 +490,7 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
 
     #[test]
     fn injects_reload_client_only_into_served_html_and_replaces_previous_client() {
-        let built = process(DEFAULT_HTML, "app", "/").unwrap();
+        let built = process(DEFAULT_HTML, "app", None, "/").unwrap();
         assert!(!built.contains("/__sycamore/reload"));
         let served = with_reload_client(&built, "session-1").unwrap();
         let served = with_reload_client(&served, "session-2").unwrap();
@@ -478,7 +548,7 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
 
     #[test]
     fn default_template_has_a_module_in_head() {
-        let html = process(DEFAULT_HTML, "my_app", "/").unwrap();
+        let html = process(DEFAULT_HTML, "my_app", None, "/").unwrap();
         let document = Html::parse_document(&html);
         let script = first(&document, "head script[type=module][data-cargo-sycamore]");
         assert!(text(script).contains("import init from \"/my_app.js\""));
@@ -488,7 +558,7 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
 
     #[test]
     fn preserves_custom_html_and_adds_an_implicit_head() {
-        let html = process("<!doctype html><HTML><BODY><main id=app>Hello</main><script src=custom.js></script></BODY></HTML>", "app", "/").unwrap();
+        let html = process("<!doctype html><HTML><BODY><main id=app>Hello</main><script src=custom.js></script></BODY></HTML>", "app", None, "/").unwrap();
         let document = Html::parse_document(&html);
         assert_eq!(text(first(&document, "main#app")), "Hello");
         assert_eq!(count(&document, "head script[data-cargo-sycamore]"), 1);
@@ -497,8 +567,8 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
 
     #[test]
     fn replaces_previous_generated_script_without_touching_user_scripts() {
-        let html = process("<head><!-- </head> --><title>Custom</title><script>window.user = true;</script></head>", "old", "/").unwrap();
-        let html = process(&html, "new", "/").unwrap();
+        let html = process("<head><!-- </head> --><title>Custom</title><script>window.user = true;</script></head>", "old", None, "/").unwrap();
+        let html = process(&html, "new", None, "/").unwrap();
         let document = Html::parse_document(&html);
         assert_eq!(count(&document, "script[data-cargo-sycamore]"), 1);
         assert_eq!(count(&document, "head script"), 2);
@@ -510,7 +580,7 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
 
     #[test]
     fn preserves_doctype_templates_and_raw_script_contents() {
-        let html = process(r#"<!doctype html><head><style>body > main { color: red; }</style><script>if (1 < 2 && 3 > 2) window.message = "<&>";</script></head><body><template><span>A &amp; B</span></template></body>"#, "app", "/").unwrap();
+        let html = process(r#"<!doctype html><head><style>body > main { color: red; }</style><script>if (1 < 2 && 3 > 2) window.message = "<&>";</script></head><body><template><span>A &amp; B</span></template></body>"#, "app", None, "/").unwrap();
         let document = Html::parse_document(&html);
         assert!(html.starts_with("<!DOCTYPE html>"));
         assert_eq!(
@@ -526,7 +596,13 @@ init().catch(error => console.error("Failed to initialize WASM:", error));
 
     #[test]
     fn encodes_asset_names_so_they_cannot_escape_the_script() {
-        let html = process(DEFAULT_HTML, "app\"</script><script>alert(1)</script>", "/").unwrap();
+        let html = process(
+            DEFAULT_HTML,
+            "app\"</script><script>alert(1)</script>",
+            None,
+            "/",
+        )
+        .unwrap();
         let document = Html::parse_document(&html);
         assert_eq!(count(&document, "script"), 1);
         assert!(text(first(&document, "script")).contains("%22%3C%2Fscript%3E"));
